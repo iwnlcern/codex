@@ -457,6 +457,8 @@ impl MonitorManager {
         let delivery_gate = pipeline.delivery_gate.take();
         #[cfg(test)]
         let lossless = pipeline.lossless;
+        #[cfg(test)]
+        let path_probe = pipeline.path_probe();
         let child = Arc::clone(&process.process);
         let committed = process.committed;
         let tail = Arc::clone(&pipeline.tail);
@@ -488,6 +490,8 @@ impl MonitorManager {
             delivery_gate,
             #[cfg(test)]
             lossless,
+            #[cfg(test)]
+            path_probe,
         ));
         if let Some(record) = monitors.get_mut(&id) {
             record.task = Some(AbortOnDropHandle::new(task));
@@ -743,6 +747,8 @@ pub(crate) struct MonitorPipeline {
     delivery_gate: Option<Arc<tokio::sync::Notify>>,
     #[cfg(test)]
     lossless: bool,
+    #[cfg(test)]
+    path_probe: Arc<PipelinePathProbe>,
 }
 
 #[cfg(test)]
@@ -753,7 +759,113 @@ pub(crate) struct PipelineHooks {
     pub(crate) lossless_downstream: bool,
 }
 
+// Supplemental test observer: reads the actual ledger and records consumed from
+// the lossless collector; controls only scheduling, never admission policy.
+#[cfg(test)]
+pub(crate) struct PipelinePathProbe {
+    pub(crate) ledger: Arc<LossLedger>,
+    reader: tokio::task::AbortHandle,
+    pub(crate) collected: std::sync::Mutex<Vec<Record>>,
+    hold_receive: std::sync::atomic::AtomicBool,
+    final_loss_parked: std::sync::atomic::AtomicBool,
+    final_loss_released: tokio::sync::Notify,
+    requested: std::sync::atomic::AtomicBool,
+    parked: std::sync::atomic::AtomicBool,
+    remaining: std::sync::atomic::AtomicUsize,
+    changed: tokio::sync::Notify,
+    released: tokio::sync::Notify,
+    full_at: std::sync::Mutex<std::time::Instant>,
+}
+#[cfg(test)]
+impl PipelinePathProbe {
+    // Hold only normal receipt: the real child exit and grace timer must drive
+    // the existing final drain, whose receiver and counter collection remain real.
+    pub(crate) fn hold_receive_for_final_loss(&self) {
+        self.hold_receive
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    pub(crate) async fn wait_final_loss(&self) {
+        while !self
+            .final_loss_parked
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            tokio::task::yield_now().await;
+        }
+    }
+    pub(crate) fn resume_final_loss(&self) {
+        self.final_loss_released.notify_one();
+    }
+    async fn before_final_loss(&self) {
+        if self.hold_receive.load(std::sync::atomic::Ordering::Acquire) {
+            self.final_loss_parked
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.final_loss_released.notified().await;
+        }
+    }
+
+    pub(crate) fn reader_finished(&self) -> bool {
+        self.reader.is_finished()
+    }
+    pub(crate) async fn pause(&self) {
+        self.requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.changed.notify_one();
+        self.wait_parked().await;
+    }
+    pub(crate) async fn wait_parked(&self) {
+        while !self.parked.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    }
+    pub(crate) async fn refill(&self) {
+        assert!(self.parked.load(std::sync::atomic::Ordering::Acquire));
+        let at = *self
+            .full_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tokio::time::sleep_until(Instant::from_std(at)).await;
+    }
+    pub(crate) fn resume(&self, records_before_pause: usize) {
+        self.remaining
+            .store(records_before_pause, std::sync::atomic::Ordering::Release);
+        self.parked
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.released.notify_one();
+    }
+    async fn checkpoint(&self, bucket: &RateBucket) {
+        if self
+            .requested
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            *self
+                .full_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = bucket.full_refill_at();
+            self.parked
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.released.notified().await;
+        }
+    }
+    fn consumed(&self) {
+        let remaining = self.remaining.load(std::sync::atomic::Ordering::Acquire);
+        if remaining != usize::MAX
+            && self
+                .remaining
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+                == 1
+        {
+            self.requested
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 impl MonitorPipeline {
+    #[cfg(test)]
+    pub(crate) fn path_probe(&self) -> Arc<PipelinePathProbe> {
+        Arc::clone(&self.path_probe)
+    }
+
     pub(crate) fn new() -> (Self, mpsc::Sender<TaggedChunk>) {
         #[cfg(test)]
         {
@@ -790,11 +902,13 @@ impl MonitorPipeline {
             #[cfg(test)]
             hooks.reader_gate,
         );
+        #[cfg(test)]
+        let reader_handle = reader.abort_handle();
         (
             Self {
                 reader,
                 records,
-                ledger,
+                ledger: Arc::clone(&ledger),
                 channel: sink.downgrade(),
                 tail,
                 #[cfg(test)]
@@ -803,6 +917,21 @@ impl MonitorPipeline {
                 delivery_gate: hooks.delivery_gate,
                 #[cfg(test)]
                 lossless: hooks.lossless_downstream,
+                #[cfg(test)]
+                path_probe: Arc::new(PipelinePathProbe {
+                    ledger: Arc::clone(&ledger),
+                    reader: reader_handle,
+                    collected: std::sync::Mutex::new(Vec::new()),
+                    hold_receive: std::sync::atomic::AtomicBool::new(false),
+                    final_loss_parked: std::sync::atomic::AtomicBool::new(false),
+                    final_loss_released: tokio::sync::Notify::new(),
+                    requested: std::sync::atomic::AtomicBool::new(false),
+                    parked: std::sync::atomic::AtomicBool::new(false),
+                    remaining: std::sync::atomic::AtomicUsize::new(usize::MAX),
+                    changed: tokio::sync::Notify::new(),
+                    released: tokio::sync::Notify::new(),
+                    full_at: std::sync::Mutex::new(std::time::Instant::now()),
+                }),
             },
             sink,
         )
@@ -898,6 +1027,7 @@ async fn delivery_loop(
     #[cfg(test)] mut unbounded: Option<mpsc::UnboundedReceiver<Record>>,
     #[cfg(test)] delivery_gate: Option<Arc<tokio::sync::Notify>>,
     #[cfg(test)] lossless: bool,
+    #[cfg(test)] path_probe: Arc<PipelinePathProbe>,
 ) {
     #[cfg(test)]
     if let Some(gate) = delivery_gate {
@@ -912,6 +1042,8 @@ async fn delivery_loop(
     let exit = process.cancellation_token();
     let mut activity_check = tokio::time::interval(Duration::from_millis(50));
     loop {
+        #[cfg(test)]
+        path_probe.checkpoint(&bucket).await;
         let loss_at = counters
             .gap_open
             .load(std::sync::atomic::Ordering::Acquire)
@@ -926,16 +1058,36 @@ async fn delivery_loop(
             });
         let received = async {
             #[cfg(test)]
+            if path_probe
+                .hold_receive
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                std::future::pending::<()>().await;
+            }
+            #[cfg(test)]
             if let Some(rx) = unbounded.as_mut() {
                 return rx.recv().await;
             }
             records.recv().await
         };
         tokio::select! {
+            _ = async {
+                #[cfg(test)] { path_probe.changed.notified().await; }
+                #[cfg(not(test))] { std::future::pending::<()>().await; }
+            } => {}
             _ = activity_check.tick() => {}
             record = received => {
                 let Some(record) = record else { break; };
                 if record.attempt != committed { continue; }
+                #[cfg(test)]
+                {
+                    path_probe.consumed();
+                    if lossless {
+                        path_probe.collected.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Record {
+                            attempt: record.attempt, stream: record.stream, bytes: record.bytes.clone(),
+                        });
+                    }
+                }
                 #[cfg(test)] let admitted = lossless || bucket.admit(std::time::Instant::now());
                 #[cfg(not(test))] let admitted = bucket.admit(std::time::Instant::now());
                 if admitted {
@@ -981,6 +1133,18 @@ async fn delivery_loop(
             continue;
         }
         #[cfg(test)]
+        if lossless {
+            path_probe
+                .collected
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(Record {
+                    attempt: record.attempt,
+                    stream: record.stream,
+                    bytes: record.bytes.clone(),
+                });
+        }
+        #[cfg(test)]
         let admitted = lossless || bucket.admit(std::time::Instant::now());
         #[cfg(not(test))]
         let admitted = bucket.admit(std::time::Instant::now());
@@ -990,6 +1154,8 @@ async fn delivery_loop(
             counters.record(DropReason::Rate);
         }
     }
+    #[cfg(test)]
+    path_probe.before_final_loss().await;
     notices.extend(
         counters
             .take()

@@ -287,6 +287,11 @@ impl RateBucket {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn full_refill_at(&self) -> Instant {
+        self.last_refill + std::time::Duration::from_secs_f64((200.0 - self.tokens) / 20.0)
+    }
+
     pub(crate) fn lossy_windows(&self) -> u32 {
         self.consecutive
     }
@@ -437,3 +442,7 @@ pub(crate) fn render_notifications(
 #[cfg(test)]
 #[path = "monitor_frame_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "monitor_frame_path_tests.rs"]
+mod path_tests;
