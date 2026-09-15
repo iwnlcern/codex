@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::Weak;
 use std::time::Duration;
 
@@ -26,6 +27,8 @@ use crate::context::ContextualUserFragment;
 use crate::context::MonitorNotification;
 use crate::session::session::Session;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::turn_input::TurnInput as SubmittedTurnInput;
+use codex_protocol::turn_input::TurnInputSubmission;
 
 /// Lines emitted within this window coalesce into one notification.
 const BATCH_WINDOW: Duration = Duration::from_millis(200);
@@ -61,11 +64,159 @@ struct MonitorEntry {
 #[derive(Default)]
 pub(crate) struct MonitorManager {
     monitors: Mutex<HashMap<String, MonitorEntry>>,
+    // The only lock held across session admission. Registry operations never
+    // acquire session locks while holding their separate short-lived lock.
+    gate: Mutex<()>,
+    wake: std::sync::Mutex<WakeState>,
+    attached: OnceLock<()>,
+    retry_task: std::sync::Mutex<Option<AbortOnDropHandle<()>>>,
+    #[cfg(test)]
+    gate_hooks: std::sync::Mutex<Option<crate::session::GateHooks>>,
+}
+
+#[derive(Default)]
+struct WakeState {
+    generation: u64,
+    pending: bool,
 }
 
 impl MonitorManager {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_gate_hooks(&self, hooks: crate::session::GateHooks) {
+        *self
+            .gate_hooks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hooks);
+    }
+
+    pub(crate) fn wake_pending(&self) -> Option<u64> {
+        let wake = self
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        wake.pending.then_some(wake.generation)
+    }
+
+    /// Attach after construction, so the session owns the retry without a cycle.
+    pub(crate) fn attach(&self, session: Weak<Session>) {
+        assert!(
+            self.attached.set(()).is_ok(),
+            "monitor manager attached twice"
+        );
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let Some(session) = session.upgrade() else {
+                    break;
+                };
+                let manager = &session.services.monitor_manager;
+                if manager.wake_pending().is_some() {
+                    manager.delivery_gate(&session, None).await;
+                }
+            }
+        });
+        *self
+            .retry_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(AbortOnDropHandle::new(task));
+    }
+
+    /// Consume one notification exactly once and service an existing obligation.
+    pub(crate) async fn deliver(&self, session: &Arc<Session>, item: ResponseItem) {
+        debug_assert!(
+            self.attached.get().is_some(),
+            "delivery before session attachment"
+        );
+        self.delivery_gate(session, Some(item)).await;
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "monitor admission and generation updates are serialized across session awaits"
+    )]
+    async fn delivery_gate(&self, session: &Arc<Session>, item: Option<ResponseItem>) {
+        // Lock order: this gate precedes every session lock in admission and
+        // recording. No caller may enter it while holding a session lock.
+        let _gate = self.gate.lock().await;
+        if let Some(generation) = self.wake_pending()
+            && !session.is_interrupted()
+        {
+            let submission = self
+                .attempt_start(
+                    session,
+                    SubmittedTurnInput::UserInput {
+                        content: Vec::new(),
+                        client_id: None,
+                    },
+                )
+                .await;
+            if matches!(submission, Ok(TurnInputSubmission::Started { .. })) {
+                let mut wake = self
+                    .wake
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if wake.generation == generation {
+                    wake.pending = false;
+                }
+            }
+        }
+        let Some(item) = item else { return };
+        if !session.is_interrupted() {
+            let Err(items) = session.inject_if_running(vec![item]).await else {
+                return;
+            };
+            let Some(item) = items.into_iter().next() else {
+                unreachable!("inject_if_running returned an empty refused notification");
+            };
+            if matches!(
+                self.attempt_start(session, SubmittedTurnInput::ResponseItem(item.clone()))
+                    .await,
+                Ok(TurnInputSubmission::Started { .. })
+            ) {
+                return;
+            }
+            session.inject_no_new_turn(vec![item], None).await;
+        } else {
+            session.inject_no_new_turn(vec![item], None).await;
+        }
+        let mut wake = self
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(wake.generation < u64::MAX, "monitor generation overflow");
+        wake.generation += 1;
+        wake.pending = true;
+    }
+
+    // Called only within delivery_gate, after its interrupt hold check.
+    async fn attempt_start(
+        &self,
+        session: &Arc<Session>,
+        input: SubmittedTurnInput,
+    ) -> codex_protocol::error::Result<TurnInputSubmission> {
+        #[cfg(test)]
+        let hooks = self
+            .gate_hooks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        #[cfg(test)]
+        if let Some(barrier) = hooks.as_ref().and_then(|hooks| hooks.before_start.as_ref()) {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+        let submission = session.start_turn_if_idle_automatic(input).await;
+        #[cfg(test)]
+        if let Some(barrier) = hooks.as_ref().and_then(|hooks| hooks.after_start.as_ref()) {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+        submission
     }
 
     pub(crate) async fn insert(
@@ -125,7 +276,23 @@ impl MonitorManager {
     /// Aborts every monitor's delivery task. The processes themselves are reaped
     /// separately by the unified-exec manager at shutdown.
     pub(crate) async fn abort_all(&self) {
+        // Cancel before acquiring the gate: the retry may itself be awaiting
+        // admission while holding it. Await cancellation to release its locks.
+        let retry = self
+            .retry_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(retry) = retry {
+            retry.abort();
+            let _ = retry.await;
+        }
         self.monitors.lock().await.clear();
+        let _gate = self.gate.lock().await;
+        self.wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending = false;
     }
 }
 
@@ -215,7 +382,7 @@ async fn delivery_loop(
                 }
             }
             () = wait_until(flush_at) => {
-                flush(&session, &description, &mut pending).await;
+                deliver_batch(&session, &description, &mut pending).await;
                 flush_at = None;
             }
             () = exit.cancelled(), if closing_at.is_none() => {
@@ -256,14 +423,14 @@ async fn delivery_loop(
             pending.push(text.to_string());
         }
     }
-    flush(&session, &description, &mut pending).await;
+    deliver_batch(&session, &description, &mut pending).await;
     // Prune the registry BEFORE announcing the exit, so a turn the exit notice
     // wakes (e.g. an `action=list`) already sees this watcher gone. A concurrent
     // `action=stop` may have removed the entry first; this is then a no-op.
     if let Some(session) = session.upgrade() {
         session.services.monitor_manager.deregister_self(&id).await;
     }
-    deliver(&session, &description, exit_notice(&process)).await;
+    emit_notification(&session, &description, exit_notice(&process)).await;
 }
 
 /// Auto-stops a watcher that hit the flood ceiling: flush what we have, tell the
@@ -276,7 +443,7 @@ async fn stop_for_flood(
     process_id: i32,
     pending: &mut Vec<String>,
 ) {
-    flush(session, description, pending).await;
+    deliver_batch(session, description, pending).await;
     // Terminate and deregister before announcing, so the agent wakes to a
     // consistent state.
     if let Some(session) = session.upgrade() {
@@ -287,7 +454,7 @@ async fn stop_for_flood(
             .await;
         session.services.monitor_manager.deregister_self(id).await;
     }
-    deliver(
+    emit_notification(
         session,
         description,
         format!(
@@ -360,24 +527,25 @@ fn exit_notice(process: &UnifiedExecProcess) -> String {
 }
 
 /// Delivers the accumulated batch as one notification and clears it.
-async fn flush(session: &Weak<Session>, description: &str, pending: &mut Vec<String>) {
+async fn deliver_batch(session: &Weak<Session>, description: &str, pending: &mut Vec<String>) {
     if pending.is_empty() {
         return;
     }
     let text = std::mem::take(pending).join("\n");
-    deliver(session, description, text).await;
+    emit_notification(session, description, text).await;
 }
 
 /// Records one notification, prefixed by the monitor's label.
-async fn deliver(session: &Weak<Session>, description: &str, body: String) {
+async fn emit_notification(session: &Weak<Session>, description: &str, body: String) {
     let Some(session) = session.upgrade() else {
         return;
     };
-    let items: Vec<ResponseItem> = vec![ContextualUserFragment::into(MonitorNotification::new(
-        description,
-        body,
-    ))];
-    session.inject_no_new_turn(items, None).await;
+    let item = ContextualUserFragment::into(MonitorNotification::new(description, body));
+    session
+        .services
+        .monitor_manager
+        .deliver(&session, item)
+        .await;
 }
 
 #[cfg(test)]

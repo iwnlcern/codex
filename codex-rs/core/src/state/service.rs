@@ -51,6 +51,7 @@ pub(crate) struct SessionServices {
     /// Immutable MCP handlers scoped to this thread's current binding.
     pub(crate) mcp_handler_cache: McpHandlerCache,
     pub(crate) unified_exec_manager: UnifiedExecProcessManager,
+    /// Owns watcher delivery and the session-lifetime pending-wake retry task.
     pub(crate) monitor_manager: MonitorManager,
     pub(crate) elicitations: ElicitationService,
     #[cfg_attr(not(unix), allow(dead_code))]
