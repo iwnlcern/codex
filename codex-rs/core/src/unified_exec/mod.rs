@@ -51,6 +51,7 @@ mod async_watcher;
 mod errors;
 mod head_tail_buffer;
 mod monitor;
+mod monitor_frame;
 mod oneshot;
 mod process;
 mod process_manager;
