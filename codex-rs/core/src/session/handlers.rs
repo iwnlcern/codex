@@ -404,9 +404,10 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
         startup_prewarm.abort().await;
     }
     let _ = sess.conversation.shutdown().await;
-    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
-    // This also joins the session-owned wake retry before services shut down.
+    // Quiesce owned monitor admissions before the final task sweep: an
+    // admission already past reservation may still install a RegularTask.
     sess.services.monitor_manager.abort_all().await;
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
     let shell_snapshot_prewarm = sess.state.lock().await.shell_snapshot_prewarm.take();
     if let Some(shell_snapshot_prewarm) = shell_snapshot_prewarm {
         shell_snapshot_prewarm.abort();

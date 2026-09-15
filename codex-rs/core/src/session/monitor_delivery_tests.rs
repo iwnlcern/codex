@@ -652,6 +652,10 @@ async fn queued_turn_clears_hold_then_retry_fires() {
 
 // Stopping the real watcher may not clear recorded session-owned work.
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the test holds the real start_task mutex to witness cancellation after reservation"
+)]
 async fn monitor_stop_leaves_flag() {
     let f = Fixture::new().await;
     f.mode(ModeKind::Plan).await;
@@ -682,10 +686,76 @@ async fn monitor_stop_leaves_flag() {
     f.complete().await;
     assert_eq!(copies(&prompt, "STOP_RECORD"), 1);
     f.close().await;
+
+    // Removal must not abort admission after it owns the notification.
+    let f = Fixture::new().await;
+    let prompt = f.slow_model().await;
+    let start_guard = f
+        .session
+        .services
+        .guardian_rejection_circuit_breaker
+        .lock()
+        .await;
+    f.monitor(serde_json::json!({"action":"start", "description":"reserved stop", "command":"echo RESERVED_STOP; sleep 60"})).await;
+    let id = f
+        .session
+        .services
+        .monitor_manager
+        .list()
+        .await
+        .pop()
+        .unwrap()
+        .id;
+    reserved_without_task(&f.session).await;
+    let stop = f.monitor(serde_json::json!({"action":"stop", "id":id}));
+    tokio::pin!(stop);
+    assert!(
+        timeout(Duration::from_millis(100), &mut stop)
+            .await
+            .is_err(),
+        "stop must join admission instead of abandoning a taskless reservation"
+    );
+    drop(start_guard);
+    timeout(LIMIT, &mut stop)
+        .await
+        .expect("stop settles owned admission");
+    f.complete().await;
+    assert_eq!(copies(&prompt, "RESERVED_STOP"), 1);
+    assert!(f.session.active_turn.lock().await.is_none());
+    let user = f.model().await;
+    f.user().await;
+    f.complete().await;
+    assert_eq!(copies(&user, "RESERVED_STOP"), 1);
+    f.close().await;
+}
+
+// Hold an existing production mutex reached after reservation/input transfer,
+// before start_task installs the RegularTask. No synthetic admission is used.
+async fn reserved_without_task(session: &Arc<Session>) {
+    timeout(LIMIT, async {
+        loop {
+            if session
+                .active_turn
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|turn| turn.task.is_none())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("real admission reserved a turn before task installation");
 }
 
 // Shutdown must cancel a retry currently suspended inside its gate, not merely clear a flag.
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the test holds the real start_task mutex to witness cancellation after reservation"
+)]
 async fn shutdown_aborts_retry_task() {
     let f = Fixture::new().await;
     f.mode(ModeKind::Plan).await;
@@ -713,6 +783,52 @@ async fn shutdown_aborts_retry_task() {
     let prompt = f.model().await;
     f.quiet(Duration::from_millis(1100)).await;
     assert!(prompt.requests().is_empty());
+
+    // The retry also owns admission after reservation, when caller cancellation
+    // alone cannot unwind the turn. Shutdown must drain, then sweep that task.
+    let f = Fixture::new().await;
+    f.mode(ModeKind::Plan).await;
+    f.deliver("RESERVED_SHUTDOWN").await;
+    let prompt = f.slow_model().await;
+    let start_guard = f
+        .session
+        .services
+        .guardian_rejection_circuit_breaker
+        .lock()
+        .await;
+    f.mode(ModeKind::Default).await;
+    reserved_without_task(&f.session).await;
+    let shutdown = handlers::shutdown_session_runtime(&f.session);
+    tokio::pin!(shutdown);
+    assert!(
+        timeout(Duration::from_millis(100), &mut shutdown)
+            .await
+            .is_err()
+    );
+    assert!(
+        f.session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|turn| turn.task.is_none()),
+        "shutdown must not sweep a reservation while its owned admission can still start"
+    );
+    drop(start_guard);
+    timeout(LIMIT, &mut shutdown)
+        .await
+        .expect("shutdown drains admission then aborts its task");
+    assert!(f.session.active_turn.lock().await.is_none());
+    assert_eq!(f.session.services.monitor_manager.wake_pending(), None);
+    let requests = prompt.requests().len();
+    sleep(Duration::from_millis(1100)).await;
+    assert_eq!(
+        prompt.requests().len(),
+        requests,
+        "no model task remains after shutdown"
+    );
+    assert!(requests <= 1);
+    assert!(f.session.active_turn.lock().await.is_none());
 }
 
 // Several refused deliveries and polls must never reinsert already-recorded items.
@@ -748,6 +864,10 @@ async fn record_never_resubmitted() {
 
 // Registry operations and shutdown must remain live alongside gate/session-lock acquisition.
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the test holds the real start_task mutex to witness cancellation after reservation"
+)]
 async fn concurrent_start_stop_shutdown_completes_under_5s() {
     let f = Fixture::new().await;
     f.monitor(serde_json::json!({"action":"start", "description":"existing watcher", "command":"sleep 60"})).await;
@@ -791,4 +911,62 @@ async fn concurrent_start_stop_shutdown_completes_under_5s() {
     f.complete().await;
     assert_eq!(copies(&prompt, "CONCURRENT_RECORD"), 1);
     f.close().await;
+    assert!(f.session.active_turn.lock().await.is_none());
+
+    // Repeat the lifecycle competition at the real reservation boundary, with
+    // shutdown's final task sweep included in the raced operation.
+    let f = Fixture::new().await;
+    f.monitor(serde_json::json!({"action":"start", "description":"reserved existing", "command":"sleep 60"})).await;
+    let existing = f
+        .session
+        .services
+        .monitor_manager
+        .list()
+        .await
+        .pop()
+        .unwrap()
+        .id;
+    let _prompt = f.slow_model().await;
+    let start_guard = f
+        .session
+        .services
+        .guardian_rejection_circuit_breaker
+        .lock()
+        .await;
+    let delivery = start_delivery(&f.session, "RESERVED_CONCURRENT");
+    reserved_without_task(&f.session).await;
+    timeout(LIMIT, async {
+        let shutdown = handlers::shutdown_session_runtime(&f.session);
+        tokio::pin!(shutdown);
+        assert!(
+            timeout(Duration::from_millis(100), &mut shutdown)
+                .await
+                .is_err()
+        );
+        assert!(
+            f.session
+                .active_turn
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|turn| turn.task.is_none())
+        );
+        let start_a = f.monitor(
+            serde_json::json!({"action":"start", "description":"reserved a", "command":"sleep 60"}),
+        );
+        let start_b = f.monitor(
+            serde_json::json!({"action":"start", "description":"reserved b", "command":"sleep 60"}),
+        );
+        let stop = f.monitor(serde_json::json!({"action":"stop", "id":existing}));
+        let release = async {
+            drop(start_guard);
+            delivery.await.unwrap();
+        };
+        tokio::join!(start_a, start_b, stop, shutdown, release);
+    })
+    .await
+    .expect("reserved admission and lifecycle operations quiesce within 5s");
+    assert!(f.session.active_turn.lock().await.is_none());
+    assert!(f.session.services.monitor_manager.list().await.is_empty());
+    assert_eq!(f.session.services.monitor_manager.wake_pending(), None);
 }

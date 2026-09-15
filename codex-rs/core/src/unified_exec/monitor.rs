@@ -18,7 +18,9 @@ use tokio::sync::broadcast::error::TryRecvError;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio::time::sleep_until;
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
+use tokio_util::task::TaskTracker;
 
 use super::UnifiedExecProcessManager;
 use super::async_watcher::TRAILING_OUTPUT_GRACE;
@@ -70,6 +72,10 @@ pub(crate) struct MonitorManager {
     wake: std::sync::Mutex<WakeState>,
     attached: OnceLock<()>,
     retry_task: std::sync::Mutex<Option<AbortOnDropHandle<()>>>,
+    // Registration and shutdown admission closure are atomic with respect to
+    // one another. This guard never spans an await.
+    stopped: std::sync::Mutex<bool>,
+    admissions: TaskTracker,
     #[cfg(test)]
     gate_hooks: std::sync::Mutex<Option<crate::session::GateHooks>>,
 }
@@ -135,11 +141,44 @@ impl MonitorManager {
         self.delivery_gate(session, Some(item)).await;
     }
 
+    async fn delivery_gate(&self, session: &Arc<Session>, item: Option<ResponseItem>) {
+        let cancelled = CancellationToken::new();
+        let _cancel_on_drop = cancelled.clone().drop_guard();
+        let operation = {
+            let stopped = self
+                .stopped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *stopped {
+                return;
+            }
+            let session = Arc::clone(session);
+            self.admissions.spawn(async move {
+                session
+                    .services
+                    .monitor_manager
+                    .run_delivery_gate(&session, item, &cancelled)
+                    .await;
+            })
+        };
+        // Unlike AbortOnDropHandle, dropping this waiter does not abort the
+        // manager-owned transaction. Admission and its bookkeeping settle
+        // together even when the watcher or retry has been stopped.
+        if let Err(error) = operation.await {
+            std::panic::resume_unwind(error.into_panic());
+        }
+    }
+
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "monitor admission and generation updates are serialized across session awaits"
     )]
-    async fn delivery_gate(&self, session: &Arc<Session>, item: Option<ResponseItem>) {
+    async fn run_delivery_gate(
+        &self,
+        session: &Arc<Session>,
+        item: Option<ResponseItem>,
+        cancelled: &CancellationToken,
+    ) {
         // Lock order: this gate precedes every session lock in admission and
         // recording. No caller may enter it while holding a session lock.
         let _gate = self.gate.lock().await;
@@ -153,9 +192,10 @@ impl MonitorManager {
                         content: Vec::new(),
                         client_id: None,
                     },
+                    cancelled,
                 )
                 .await;
-            if matches!(submission, Ok(TurnInputSubmission::Started { .. })) {
+            if matches!(submission, Some(Ok(TurnInputSubmission::Started { .. }))) {
                 let mut wake = self
                     .wake
                     .lock()
@@ -174,9 +214,13 @@ impl MonitorManager {
                 unreachable!("inject_if_running returned an empty refused notification");
             };
             if matches!(
-                self.attempt_start(session, SubmittedTurnInput::ResponseItem(item.clone()))
-                    .await,
-                Ok(TurnInputSubmission::Started { .. })
+                self.attempt_start(
+                    session,
+                    SubmittedTurnInput::ResponseItem(item.clone()),
+                    cancelled
+                )
+                .await,
+                Some(Ok(TurnInputSubmission::Started { .. }))
             ) {
                 return;
             }
@@ -198,7 +242,8 @@ impl MonitorManager {
         &self,
         session: &Arc<Session>,
         input: SubmittedTurnInput,
-    ) -> codex_protocol::error::Result<TurnInputSubmission> {
+        cancelled: &CancellationToken,
+    ) -> Option<codex_protocol::error::Result<TurnInputSubmission>> {
         #[cfg(test)]
         let hooks = self
             .gate_hooks
@@ -207,16 +252,25 @@ impl MonitorManager {
             .take();
         #[cfg(test)]
         if let Some(barrier) = hooks.as_ref().and_then(|hooks| hooks.before_start.as_ref()) {
-            barrier.wait().await;
-            barrier.wait().await;
+            tokio::select! {
+                _ = cancelled.cancelled() => return None,
+                _ = async { barrier.wait().await; barrier.wait().await; } => {}
+            }
         }
+        if cancelled.is_cancelled() {
+            return None;
+        }
+        // StartIfIdle is not cancellation-safe after reserving active_turn.
+        // From here through recording/flag updates, this owned task must finish.
         let submission = session.start_turn_if_idle_automatic(input).await;
         #[cfg(test)]
         if let Some(barrier) = hooks.as_ref().and_then(|hooks| hooks.after_start.as_ref()) {
-            barrier.wait().await;
-            barrier.wait().await;
+            tokio::select! {
+                _ = cancelled.cancelled() => {},
+                _ = async { barrier.wait().await; barrier.wait().await; } => {}
+            }
         }
-        submission
+        Some(submission)
     }
 
     pub(crate) async fn insert(
@@ -227,25 +281,44 @@ impl MonitorManager {
         command: String,
         task: JoinHandle<()>,
     ) {
-        self.monitors.lock().await.insert(
-            id,
-            MonitorEntry {
-                description,
-                command,
-                process_id,
-                _task: AbortOnDropHandle::new(task),
-            },
-        );
+        let rejected = {
+            let mut monitors = self.monitors.lock().await;
+            let stopped = self
+                .stopped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *stopped {
+                Some(task)
+            } else {
+                monitors.insert(
+                    id,
+                    MonitorEntry {
+                        description,
+                        command,
+                        process_id,
+                        _task: AbortOnDropHandle::new(task),
+                    },
+                );
+                None
+            }
+        };
+        if let Some(task) = rejected {
+            task.abort();
+            let _ = task.await;
+        }
     }
 
-    /// Removes a monitor, returning its process id so the caller can terminate
-    /// the underlying process. Dropping the entry aborts its delivery task.
+    /// Stop the watcher, then let its already-owned admission settle. Waiting
+    /// may also drain other admissions already in the same session gate.
     pub(crate) async fn remove(&self, id: &str) -> Option<i32> {
-        self.monitors
-            .lock()
-            .await
-            .remove(id)
-            .map(|entry| entry.process_id)
+        let entry = self.monitors.lock().await.remove(id)?;
+        entry._task.abort();
+        let _ = entry._task.await;
+        // close enables wait at zero; it does not prohibit new tracked tasks.
+        // Only `stopped` closes registration, so a live-session stop is reusable.
+        self.admissions.close();
+        self.admissions.wait().await;
+        Some(entry.process_id)
     }
 
     /// Removes a monitor entry on behalf of its OWN delivery task as that task
@@ -276,8 +349,12 @@ impl MonitorManager {
     /// Aborts every monitor's delivery task. The processes themselves are reaped
     /// separately by the unified-exec manager at shutdown.
     pub(crate) async fn abort_all(&self) {
-        // Cancel before acquiring the gate: the retry may itself be awaiting
-        // admission while holding it. Await cancellation to release its locks.
+        // Stop registration, then cancel callers before waiting for the gate.
+        // Their owned admissions finish instead of dropping reserved turns.
+        *self
+            .stopped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         let retry = self
             .retry_task
             .lock()
@@ -287,7 +364,15 @@ impl MonitorManager {
             retry.abort();
             let _ = retry.await;
         }
-        self.monitors.lock().await.clear();
+        let monitors = std::mem::take(&mut *self.monitors.lock().await);
+        for entry in monitors.values() {
+            entry._task.abort();
+        }
+        for entry in monitors.into_values() {
+            let _ = entry._task.await;
+        }
+        self.admissions.close();
+        self.admissions.wait().await;
         let _gate = self.gate.lock().await;
         self.wake
             .lock()
