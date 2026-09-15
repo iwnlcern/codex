@@ -1,29 +1,16 @@
-//! Command-monitor registry and output delivery.
-//!
-//! A monitor runs a shell command as a long-lived background process and
-//! delivers each output line (stdout or stderr) to the session as a
-//! notification, waking an idle session at the next turn boundary. It lives
-//! inside `unified_exec` so the delivery loop can read the process's
-//! `pub(super)` output stream.
-
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::sync::Weak;
-use std::time::Duration;
-
-use tokio::sync::Mutex;
-use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::broadcast::error::TryRecvError;
-use tokio::task::JoinHandle;
-use tokio::time::Instant;
-use tokio::time::sleep_until;
-use tokio_util::sync::CancellationToken;
-use tokio_util::task::AbortOnDropHandle;
-use tokio_util::task::TaskTracker;
-
-use super::UnifiedExecProcessManager;
+//! Monitor-owned process reservations, framing pipeline, and session delivery.
 use super::async_watcher::TRAILING_OUTPUT_GRACE;
+use super::monitor_frame::AttemptNonce;
+use super::monitor_frame::DropReason;
+use super::monitor_frame::LossCounters;
+use super::monitor_frame::LossLedger;
+use super::monitor_frame::Notice;
+use super::monitor_frame::PartialTail;
+use super::monitor_frame::RateBucket;
+use super::monitor_frame::Record;
+use super::monitor_frame::RecordFramer;
+use super::monitor_frame::Stream;
+use super::monitor_frame::render_notifications;
 use super::process::UnifiedExecProcess;
 use crate::context::ContextualUserFragment;
 use crate::context::MonitorNotification;
@@ -31,62 +18,108 @@ use crate::session::session::Session;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::turn_input::TurnInput as SubmittedTurnInput;
 use codex_protocol::turn_input::TurnInputSubmission;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::Weak;
+use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio::time::sleep_until;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
+use tokio_util::task::TaskTracker;
 
-/// Lines emitted within this window coalesce into one notification.
-const BATCH_WINDOW: Duration = Duration::from_millis(200);
-
-/// A monitor that emits more than this many lines is auto-stopped so a runaway
-/// command cannot wake the agent without bound.
-const FLOOD_MAX_LINES: usize = 5000;
-
-/// A run of bytes with no terminating newline is truncated at this length, so a
-/// watcher that streams without newlines (a binary blob, `cat /dev/urandom`)
-/// cannot grow the delivery buffer, or one notification, without bound. Each
-/// truncation still counts toward the line ceiling, so an endless newline-free
-/// stream trips the flood guard instead of exhausting host memory.
-const MAX_LINE_BYTES: usize = 16 * 1024;
-
-/// A snapshot of one active monitor, returned by [`MonitorManager::list`].
 pub(crate) struct MonitorInfo {
     pub id: String,
     pub description: String,
     pub command: String,
 }
-
-struct MonitorEntry {
+struct MonitorRecord {
     description: String,
     command: String,
     process_id: i32,
-    _task: AbortOnDropHandle<()>,
+    process: Option<MonitorProcess>,
+    pipeline: Option<MonitorPipeline>,
+    task: Option<AbortOnDropHandle<()>>,
 }
-
-/// Per-session registry of active monitors. Holds the delivery tasks; the
-/// underlying processes live in the shared [`UnifiedExecProcessManager`] store
-/// and are reaped by its `terminate_all_processes` at session shutdown.
-#[derive(Default)]
 pub(crate) struct MonitorManager {
-    monitors: Mutex<HashMap<String, MonitorEntry>>,
-    // The only lock held across session admission. Registry operations never
-    // acquire session locks while holding their separate short-lived lock.
+    monitors: Mutex<HashMap<String, MonitorRecord>>,
+    slots: Arc<Semaphore>,
+    shutdown: CancellationToken,
     gate: Mutex<()>,
     wake: std::sync::Mutex<WakeState>,
     attached: OnceLock<()>,
     retry_task: std::sync::Mutex<Option<AbortOnDropHandle<()>>>,
-    // Registration and shutdown admission closure are atomic with respect to
-    // one another. This guard never spans an await.
     stopped: std::sync::Mutex<bool>,
     admissions: TaskTracker,
+    starts: TaskTracker,
+    cleanups: TaskTracker,
+    #[cfg(test)]
+    cleanup_gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    #[cfg(test)]
+    registered_approvals: std::sync::Mutex<Vec<String>>,
+    #[cfg(test)]
+    unregistered_approvals: std::sync::Mutex<Vec<String>>,
     #[cfg(test)]
     gate_hooks: std::sync::Mutex<Option<crate::session::GateHooks>>,
 }
-
+impl Default for MonitorManager {
+    fn default() -> Self {
+        Self {
+            monitors: Mutex::default(),
+            slots: Arc::new(Semaphore::new(8)),
+            shutdown: CancellationToken::new(),
+            gate: Mutex::default(),
+            wake: std::sync::Mutex::default(),
+            attached: OnceLock::new(),
+            retry_task: std::sync::Mutex::default(),
+            stopped: std::sync::Mutex::new(false),
+            admissions: TaskTracker::new(),
+            starts: TaskTracker::new(),
+            cleanups: TaskTracker::new(),
+            #[cfg(test)]
+            cleanup_gate: std::sync::Mutex::default(),
+            #[cfg(test)]
+            registered_approvals: std::sync::Mutex::default(),
+            #[cfg(test)]
+            unregistered_approvals: std::sync::Mutex::default(),
+            #[cfg(test)]
+            gate_hooks: std::sync::Mutex::default(),
+        }
+    }
+}
 #[derive(Default)]
 struct WakeState {
     generation: u64,
     pending: bool,
 }
-
 impl MonitorManager {
+    #[cfg(test)]
+    pub(crate) fn registered_approval_ids(&self) -> Vec<String> {
+        self.registered_approvals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    #[cfg(test)]
+    pub(crate) fn unregistered_approval_ids(&self) -> Vec<String> {
+        self.unregistered_approvals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    #[cfg(test)]
+    fn record_unregistered_approval(&self, id: &str) {
+        self.unregistered_approvals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(id.to_owned());
+    }
+
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -273,6 +306,198 @@ impl MonitorManager {
         Some(submission)
     }
 
+    pub(crate) fn reserve(&self) -> Option<MonitorSlot> {
+        let stopped = self
+            .stopped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *stopped {
+            return None;
+        }
+        self.slots
+            .clone()
+            .try_acquire_owned()
+            .ok()
+            .map(|permit| MonitorSlot { _permit: permit })
+    }
+
+    pub(crate) async fn start_with_pipeline(
+        &self,
+        session: &Arc<Session>,
+        context: &super::UnifiedExecContext,
+        request: super::ExecCommandRequest,
+        description: String,
+        pipeline: MonitorPipeline,
+    ) -> Result<MonitorId, super::UnifiedExecError> {
+        let slot = self.reserve().ok_or_else(|| {
+            let stopped = *self
+                .stopped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            super::UnifiedExecError::process_failed(
+                if stopped {
+                    "session stopped"
+                } else {
+                    "eight monitors already reserved"
+                }
+                .into(),
+            )
+        })?;
+        let cancellation = context.cancellation_token.child_token();
+        let _cancel_on_drop = cancellation.clone().drop_guard();
+        let context = super::UnifiedExecContext::new(
+            Arc::clone(session),
+            Arc::clone(&context.step_context),
+            cancellation,
+            format!("monitor-preparation-{}", uuid::Uuid::new_v4()),
+        );
+        let task = {
+            let stopped = self
+                .stopped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *stopped {
+                return Err(super::UnifiedExecError::process_failed(
+                    "session stopped".into(),
+                ));
+            }
+            let session = Arc::clone(session);
+            self.starts.spawn(async move {
+                session
+                    .services
+                    .monitor_manager
+                    .start_reserved(&session, &context, request, description, pipeline, slot)
+                    .await
+            })
+        };
+        // Dropping the caller cancels its token, never the runtime's approval
+        // cleanup future. Shutdown joins these owned preparations explicitly.
+        task.await
+            .map_err(|error| super::UnifiedExecError::process_failed(error.to_string()))?
+    }
+
+    async fn start_reserved(
+        &self,
+        session: &Arc<Session>,
+        context: &super::UnifiedExecContext,
+        request: super::ExecCommandRequest,
+        description: String,
+        mut pipeline: MonitorPipeline,
+        slot: MonitorSlot,
+    ) -> Result<MonitorId, super::UnifiedExecError> {
+        if let super::UnifiedExecOutputMode::Tagged { sink } = &request.output_mode {
+            debug_assert!(
+                pipeline
+                    .channel
+                    .upgrade()
+                    .is_some_and(|channel| channel.same_channel(sink))
+            );
+        } else {
+            return Err(super::UnifiedExecError::unsupported("untagged-monitor"));
+        }
+        let command = request.hook_command.clone();
+        let opening = session
+            .services
+            .unified_exec_manager
+            .exec_monitor_command(request, context, slot);
+        tokio::pin!(opening);
+        // Keep the runtime alive through its network-approval cleanup. User
+        // command approvals do not observe cancellation themselves, so resolve
+        // only our private preparation ID while continuing to poll the runtime.
+        let opened = tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => { context.cancellation_token.cancel(); None }
+            _ = context.cancellation_token.cancelled() => None,
+            result = &mut opening => Some(result),
+        };
+        let opened = match opened {
+            Some(result) => result,
+            None => {
+                let mut abort_approval = tokio::time::interval(Duration::from_millis(20));
+                loop {
+                    tokio::select! {
+                        biased;
+                        result = &mut opening => break result,
+                        _ = abort_approval.tick() => {
+                            session.notify_approval(&context.call_id, codex_protocol::protocol::ReviewDecision::Abort).await;
+                        }
+                    }
+                }
+            }
+        };
+        let mut process = opened.map_err(|(error, _slot)| error)?;
+        // open_session_with_sandbox returned a registered deferred approval:
+        // begin_network_approval awaited register_call before returning it.
+        #[cfg(test)]
+        if let Some(approval) = &process.network_approval {
+            self.registered_approvals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(approval.registration_id().to_owned());
+        }
+        let counters = pipeline.commit(process.committed);
+        let id = format!("mon_{}", uuid::Uuid::new_v4());
+        let mut monitors = self.monitors.lock().await;
+        let stopped = *self
+            .stopped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if stopped || context.cancellation_token.is_cancelled() {
+            drop(monitors);
+            process.cleanup().await;
+            return Err(super::UnifiedExecError::process_failed(
+                "monitor start cancelled before registration".into(),
+            ));
+        }
+        let (_, empty) = mpsc::channel(1);
+        let records = std::mem::replace(&mut pipeline.records, empty);
+        #[cfg(test)]
+        let unbounded = pipeline.unbounded.take();
+        #[cfg(test)]
+        let delivery_gate = pipeline.delivery_gate.take();
+        #[cfg(test)]
+        let lossless = pipeline.lossless;
+        let child = Arc::clone(&process.process);
+        let committed = process.committed;
+        let tail = Arc::clone(&pipeline.tail);
+        monitors.insert(
+            id.clone(),
+            MonitorRecord {
+                description: description.clone(),
+                command,
+                process_id: 0,
+                process: Some(process),
+                pipeline: Some(pipeline),
+                task: None,
+            },
+        );
+        // No await between insertion and installing the task while holding this
+        // short registry guard: stop cannot remove an incompletely owned record.
+        let task = tokio::spawn(delivery_loop(
+            Arc::downgrade(session),
+            id.clone(),
+            description,
+            child,
+            committed,
+            records,
+            counters,
+            tail,
+            #[cfg(test)]
+            unbounded,
+            #[cfg(test)]
+            delivery_gate,
+            #[cfg(test)]
+            lossless,
+        ));
+        if let Some(record) = monitors.get_mut(&id) {
+            record.task = Some(AbortOnDropHandle::new(task));
+        }
+        Ok(id)
+    }
+
+    // Compatibility for the two pre-existing registry-only controls. Production
+    // registers complete process/pipeline ownership exclusively in start_with_pipeline.
+    #[cfg(test)]
     pub(crate) async fn insert(
         &self,
         id: String,
@@ -281,56 +506,89 @@ impl MonitorManager {
         command: String,
         task: JoinHandle<()>,
     ) {
-        let rejected = {
-            let mut monitors = self.monitors.lock().await;
-            let stopped = self
-                .stopped
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if *stopped {
-                Some(task)
-            } else {
-                monitors.insert(
-                    id,
-                    MonitorEntry {
-                        description,
-                        command,
-                        process_id,
-                        _task: AbortOnDropHandle::new(task),
-                    },
-                );
+        self.monitors.lock().await.insert(
+            id,
+            MonitorRecord {
+                description,
+                command,
+                process_id,
+                process: None,
+                pipeline: None,
+                task: Some(AbortOnDropHandle::new(task)),
+            },
+        );
+    }
+
+    // The registry lock serializes transfer to cleanup ownership with shutdown.
+    // Acquire the token before removing a record; dropping any caller cannot
+    // drop the process, approval, pipeline, or slot out of the manager's census.
+    async fn take_for_cleanup(&self, id: &str, abort_delivery: bool) -> Option<JoinHandle<i32>> {
+        let mut records = self.monitors.lock().await;
+        let token = self.cleanups.token();
+        let record = records.remove(id)?;
+        Some(Self::spawn_cleanup(
+            record,
+            token,
+            self.shutdown.clone(),
+            abort_delivery,
+        ))
+    }
+
+    fn spawn_cleanup(
+        mut record: MonitorRecord,
+        token: tokio_util::task::task_tracker::TaskTrackerToken,
+        shutdown: CancellationToken,
+        abort_delivery: bool,
+    ) -> JoinHandle<i32> {
+        tokio::spawn(async move {
+            let _ownership = token;
+            if let Some(mut task) = record.task.take() {
+                if abort_delivery {
+                    task.abort();
+                    let _ = task.await;
+                } else {
+                    // Self-deregister returns before this join. Shutdown can
+                    // still abort that caller, including a final admission wait.
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => {
+                            task.abort();
+                            let _ = task.await;
+                        }
+                        _ = &mut task => {}
+                    }
+                }
+            }
+            if let Some(process) = record.process.as_mut() {
+                process.cleanup().await;
+            }
+            record.pipeline.take();
+            let process_id = record.process_id;
+            drop(record); // Release the slot before the cleanup tracker token.
+            process_id
+        })
+    }
+
+    pub(crate) async fn remove(&self, id: &str) -> Option<i32> {
+        let cleanup = self.take_for_cleanup(id, true).await?;
+        let process_id = match cleanup.await {
+            Ok(process_id) => Some(process_id),
+            Err(error) => {
+                tracing::warn!(%error, "monitor cleanup task failed");
                 None
             }
         };
-        if let Some(task) = rejected {
-            task.abort();
-            let _ = task.await;
-        }
-    }
-
-    /// Stop the watcher, then let its already-owned admission settle. Waiting
-    /// may also drain other admissions already in the same session gate.
-    pub(crate) async fn remove(&self, id: &str) -> Option<i32> {
-        let entry = self.monitors.lock().await.remove(id)?;
-        entry._task.abort();
-        let _ = entry._task.await;
-        // close enables wait at zero; it does not prohibit new tracked tasks.
-        // Only `stopped` closes registration, so a live-session stop is reusable.
+        // Cleanup joins the delivery caller first. Its already-owned admission
+        // remains independent and settles before this stop returns.
         self.admissions.close();
         self.admissions.wait().await;
-        Some(entry.process_id)
+        process_id
     }
 
-    /// Removes a monitor entry on behalf of its OWN delivery task as that task
-    /// exits. `remove` aborts the entry's task by dropping its abort-on-drop
-    /// handle, which is correct for an external `action=stop` but would cancel
-    /// this task's own final exit-notice delivery; defusing the handle lets the
-    /// loop prune itself first and still announce the exit.
     pub(crate) async fn deregister_self(&self, id: &str) {
-        if let Some(entry) = self.monitors.lock().await.remove(id) {
-            let MonitorEntry { _task, .. } = entry;
-            std::mem::forget(_task);
-        }
+        // Do not await our own delivery handle. The manager-owned cleanup joins
+        // it after this function returns and the final notice has been delivered.
+        self.take_for_cleanup(id, false).await;
     }
 
     pub(crate) async fn list(&self) -> Vec<MonitorInfo> {
@@ -338,23 +596,22 @@ impl MonitorManager {
             .lock()
             .await
             .iter()
-            .map(|(id, entry)| MonitorInfo {
+            .map(|(id, record)| MonitorInfo {
                 id: id.clone(),
-                description: entry.description.clone(),
-                command: entry.command.clone(),
+                description: record.description.clone(),
+                command: record.command.clone(),
             })
             .collect()
     }
 
-    /// Aborts every monitor's delivery task. The processes themselves are reaped
-    /// separately by the unified-exec manager at shutdown.
     pub(crate) async fn abort_all(&self) {
-        // Stop registration, then cancel callers before waiting for the gate.
-        // Their owned admissions finish instead of dropping reserved turns.
         *self
             .stopped
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.shutdown.cancel();
+        self.starts.close();
+        self.starts.wait().await;
         let retry = self
             .retry_task
             .lock()
@@ -364,13 +621,17 @@ impl MonitorManager {
             retry.abort();
             let _ = retry.await;
         }
-        let monitors = std::mem::take(&mut *self.monitors.lock().await);
-        for entry in monitors.values() {
-            entry._task.abort();
+        {
+            let mut records = self.monitors.lock().await;
+            for (_, record) in records.drain() {
+                let token = self.cleanups.token();
+                Self::spawn_cleanup(record, token, self.shutdown.clone(), true);
+            }
+            // No starts remain and registration is closed. Every removed record
+            // is now tracked, including concurrent stop/self-deregister transfers.
+            self.cleanups.close();
         }
-        for entry in monitors.into_values() {
-            let _ = entry._task.await;
-        }
+        self.cleanups.wait().await;
         self.admissions.close();
         self.admissions.wait().await;
         let _gate = self.gate.lock().await;
@@ -381,256 +642,419 @@ impl MonitorManager {
     }
 }
 
-/// Spawns the delivery task for an already-running process, returning its
-/// handle. Returns `None` if the process is no longer alive (it exited within
-/// the spawn's yield window, so it was never a long-lived watcher). `seed` is
-/// the output the spawn's initial yield captured before this task subscribed;
-/// it is delivered first because the broadcast does not replay to a late
-/// subscriber, so without it those early lines would be lost.
-pub(crate) async fn spawn_delivery(
-    manager: &UnifiedExecProcessManager,
-    process_id: i32,
-    id: String,
-    session: Weak<Session>,
-    description: String,
-    seed: Vec<u8>,
-) -> Option<JoinHandle<()>> {
-    let process = manager.process_by_id(process_id).await?;
-    Some(tokio::spawn(delivery_loop(
-        process,
-        process_id,
-        id,
-        session,
-        description,
-        seed,
-    )))
+pub(crate) type MonitorId = String;
+pub(crate) struct MonitorSlot {
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
-async fn delivery_loop(
-    process: Arc<UnifiedExecProcess>,
-    process_id: i32,
-    id: String,
-    session: Weak<Session>,
-    description: String,
-    seed: Vec<u8>,
-) {
-    let mut rx = process.output_receiver();
-    let exit = process.cancellation_token();
-    let mut buf: Vec<u8> = Vec::new();
-    let mut pending: Vec<String> = Vec::new();
-    // Counts lines delivered plus dropped-chunk markers; bounds the total volume
-    // a single watcher can wake the agent with. A `Lagged` burst counts by the
-    // number of chunks it skipped so a runaway watcher trips the ceiling fast.
-    let mut flood_count: usize = 0;
-    let mut flush_at: Option<Instant> = None;
-    // Set once the process exits: keep draining for a short grace so a final
-    // chunk racing the cancellation token still lands (mirrors async_watcher).
-    let mut closing_at: Option<Instant> = None;
+pub(crate) struct MonitorProcess {
+    pub(crate) slot: MonitorSlot,
+    pub(crate) process: Arc<UnifiedExecProcess>,
+    pub(crate) committed: AttemptNonce,
+    pub(crate) cancellation: CancellationToken,
+    pub(crate) network_approval: Option<crate::tools::network_approval::DeferredNetworkApproval>,
+    pub(crate) denial_watcher: Option<JoinHandle<()>>,
+    pub(crate) session: Weak<Session>,
+}
+impl MonitorProcess {
+    async fn cleanup(&mut self) {
+        self.cancellation.cancel();
+        self.process.terminate();
+        #[cfg(test)]
+        if let Some(session) = self.session.upgrade() {
+            let hook = session
+                .services
+                .monitor_manager
+                .cleanup_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some((reached, release)) = hook {
+                reached.notify_one();
+                release.notified().await;
+            }
+        }
+        if let Some(task) = self.denial_watcher.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(approval) = self.network_approval.take()
+            && let Some(session) = self.session.upgrade()
+        {
+            session
+                .services
+                .network_approval
+                .unregister_call(approval.registration_id())
+                .await;
+            #[cfg(test)]
+            session
+                .services
+                .monitor_manager
+                .record_unregistered_approval(approval.registration_id());
+        }
+    }
+}
+impl Drop for MonitorProcess {
+    fn drop(&mut self) {
+        // Own the gap between successful spawn and registry insertion, including
+        // cancellation of the caller while it waits for the registry lock.
+        let _ = &self.slot;
+        self.cancellation.cancel();
+        self.process.terminate();
+        if let Some(task) = self.denial_watcher.take() {
+            task.abort();
+        }
+        if let Some(approval) = self.network_approval.take()
+            && let Some(session) = self.session.upgrade()
+        {
+            tokio::spawn(async move {
+                session
+                    .services
+                    .network_approval
+                    .unregister_call(approval.registration_id())
+                    .await;
+                #[cfg(test)]
+                session
+                    .services
+                    .monitor_manager
+                    .record_unregistered_approval(approval.registration_id());
+            });
+        }
+    }
+}
 
-    // Deliver the initial-yield output the broadcast never replayed to us.
-    if extend_lines(
-        &mut buf,
-        &seed,
-        &mut pending,
-        &mut flood_count,
-        &mut flush_at,
-    ) {
-        stop_for_flood(&session, &description, &id, process_id, &mut pending).await;
-        return;
+#[derive(Debug)]
+pub(crate) struct TaggedChunk {
+    pub(crate) attempt: AttemptNonce,
+    pub(crate) stream: Stream,
+    pub(crate) bytes: Vec<u8>,
+}
+
+type Tail = Arc<std::sync::Mutex<Option<(AttemptNonce, PartialTail)>>>;
+pub(crate) struct MonitorPipeline {
+    reader: JoinHandle<()>,
+    records: mpsc::Receiver<Record>,
+    ledger: Arc<LossLedger>,
+    channel: mpsc::WeakSender<TaggedChunk>,
+    tail: Tail,
+    #[cfg(test)]
+    unbounded: Option<mpsc::UnboundedReceiver<Record>>,
+    #[cfg(test)]
+    delivery_gate: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(test)]
+    lossless: bool,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct PipelineHooks {
+    pub(crate) reader_gate: Option<Arc<tokio::sync::Notify>>,
+    pub(crate) delivery_gate: Option<Arc<tokio::sync::Notify>>,
+    pub(crate) lossless_downstream: bool,
+}
+
+impl MonitorPipeline {
+    pub(crate) fn new() -> (Self, mpsc::Sender<TaggedChunk>) {
+        #[cfg(test)]
+        {
+            Self::new_with_hooks(PipelineHooks::default())
+        }
+        #[cfg(not(test))]
+        {
+            Self::build()
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn new_with_hooks(hooks: PipelineHooks) -> (Self, mpsc::Sender<TaggedChunk>) {
+        Self::build(hooks)
     }
 
+    fn build(#[cfg(test)] hooks: PipelineHooks) -> (Self, mpsc::Sender<TaggedChunk>) {
+        let (sink, tagged_rx) = mpsc::channel(128);
+        let (records_tx, records) = mpsc::channel(256);
+        let ledger = Arc::new(LossLedger::default());
+        let tail = Arc::new(std::sync::Mutex::new(None));
+        let output = RecordOutput::Bounded(records_tx);
+        #[cfg(test)]
+        let (output, unbounded) = if hooks.lossless_downstream {
+            let (tx, rx) = mpsc::unbounded_channel();
+            (RecordOutput::Unbounded(tx), Some(rx))
+        } else {
+            (output, None)
+        };
+        let reader = spawn_reader_with_state(
+            tagged_rx,
+            Arc::clone(&ledger),
+            output,
+            Arc::clone(&tail),
+            #[cfg(test)]
+            hooks.reader_gate,
+        );
+        (
+            Self {
+                reader,
+                records,
+                ledger,
+                channel: sink.downgrade(),
+                tail,
+                #[cfg(test)]
+                unbounded,
+                #[cfg(test)]
+                delivery_gate: hooks.delivery_gate,
+                #[cfg(test)]
+                lossless: hooks.lossless_downstream,
+            },
+            sink,
+        )
+    }
+    pub(crate) fn commit(&self, attempt: AttemptNonce) -> Arc<LossCounters> {
+        self.ledger.commit(attempt)
+    }
+}
+impl Drop for MonitorPipeline {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+enum RecordOutput {
+    Bounded(mpsc::Sender<Record>),
+    #[cfg(test)]
+    Unbounded(mpsc::UnboundedSender<Record>),
+}
+impl RecordOutput {
+    fn send(&self, record: Record) -> bool {
+        match self {
+            Self::Bounded(tx) => tx.try_send(record).is_ok(),
+            #[cfg(test)]
+            Self::Unbounded(tx) => tx.send(record).is_ok(),
+        }
+    }
+}
+
+pub(crate) fn spawn_reader(
+    tagged_rx: mpsc::Receiver<TaggedChunk>,
+    ledger: Arc<LossLedger>,
+    records_tx: mpsc::Sender<Record>,
+) -> JoinHandle<()> {
+    spawn_reader_with_state(
+        tagged_rx,
+        ledger,
+        RecordOutput::Bounded(records_tx),
+        Arc::new(std::sync::Mutex::new(None)),
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn spawn_reader_with_state(
+    mut tagged_rx: mpsc::Receiver<TaggedChunk>,
+    ledger: Arc<LossLedger>,
+    output: RecordOutput,
+    tail: Tail,
+    #[cfg(test)] reader_gate: Option<Arc<tokio::sync::Notify>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        #[cfg(test)]
+        if let Some(gate) = reader_gate {
+            gate.notified().await;
+        }
+        let mut attempt = AttemptNonce::new(0);
+        let mut framer = RecordFramer::new(attempt);
+        let mut counters = ledger.for_attempt(attempt);
+        while let Some(chunk) = tagged_rx.recv().await {
+            if chunk.attempt != attempt {
+                framer.reset();
+                attempt = chunk.attempt;
+                framer = RecordFramer::new(attempt);
+                counters = ledger.for_attempt(attempt);
+            }
+            for record in framer.push(chunk.stream, &chunk.bytes, &counters) {
+                if !output.send(record) {
+                    counters.record(DropReason::ChannelFull);
+                }
+            }
+        }
+        *tail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            framer.finish().map(|tail| (attempt, tail));
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "owned pipeline state crosses the delivery task boundary together"
+)]
+async fn delivery_loop(
+    session: Weak<Session>,
+    id: String,
+    description: String,
+    process: Arc<UnifiedExecProcess>,
+    committed: AttemptNonce,
+    mut records: mpsc::Receiver<Record>,
+    counters: Arc<LossCounters>,
+    tail: Tail,
+    #[cfg(test)] mut unbounded: Option<mpsc::UnboundedReceiver<Record>>,
+    #[cfg(test)] delivery_gate: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(test)] lossless: bool,
+) {
+    #[cfg(test)]
+    if let Some(gate) = delivery_gate {
+        gate.notified().await;
+    }
+    let mut bucket = RateBucket::new(std::time::Instant::now());
+    let mut number = 1;
+    let mut pending = Vec::new();
+    let mut notices = Vec::new();
+    let mut flush_at = None;
+    let mut closing_at = None;
+    let exit = process.cancellation_token();
+    let mut activity_check = tokio::time::interval(Duration::from_millis(50));
     loop {
+        let loss_at = counters
+            .gap_open
+            .load(std::sync::atomic::Ordering::Acquire)
+            .then(|| {
+                Instant::from_std(
+                    *counters
+                        .last_activity
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        + Duration::from_secs(2),
+                )
+            });
+        let received = async {
+            #[cfg(test)]
+            if let Some(rx) = unbounded.as_mut() {
+                return rx.recv().await;
+            }
+            records.recv().await
+        };
         tokio::select! {
-            received = rx.recv() => {
-                let flooded = match received {
-                    Ok(chunk) => {
-                        extend_lines(&mut buf, &chunk, &mut pending, &mut flood_count, &mut flush_at)
+            _ = activity_check.tick() => {}
+            record = received => {
+                let Some(record) = record else { break; };
+                if record.attempt != committed { continue; }
+                #[cfg(test)] let admitted = lossless || bucket.admit(std::time::Instant::now());
+                #[cfg(not(test))] let admitted = bucket.admit(std::time::Instant::now());
+                if admitted {
+                    notices.extend(counters.take().into_iter().map(|(reason, count)| Notice::loss(reason, count)));
+                    pending.push(record);
+                    flush_at.get_or_insert(Instant::now() + Duration::from_millis(200));
+                } else {
+                    counters.record(DropReason::Rate);
+                    if bucket.lossy_windows() >= 3 {
+                        notices.push(Notice::flood_stop());
+                        process.terminate();
+                        break;
                     }
-                    Err(RecvError::Lagged(skipped)) => {
-                        // The watcher outran the output channel. Surface the gap
-                        // instead of dropping it silently, and count it toward the
-                        // flood guard so a runaway command still trips the ceiling.
-                        flood_count += skipped as usize;
-                        pending.push(format!(
-                            "(dropped ~{skipped} chunks: watcher output too fast)"
-                        ));
-                        if flush_at.is_none() {
-                            flush_at = Some(Instant::now() + BATCH_WINDOW);
-                        }
-                        flood_count >= FLOOD_MAX_LINES
-                    }
-                    Err(RecvError::Closed) => break,
-                };
-                if flooded {
-                    stop_for_flood(&session, &description, &id, process_id, &mut pending).await;
-                    return;
                 }
             }
             () = wait_until(flush_at) => {
-                deliver_batch(&session, &description, &mut pending).await;
+                flush(&session, &id, &description, &mut number, &mut pending, &mut notices).await;
                 flush_at = None;
             }
-            () = exit.cancelled(), if closing_at.is_none() => {
-                closing_at = Some(Instant::now() + TRAILING_OUTPUT_GRACE);
+            () = wait_until(loss_at) => {
+                notices.extend(counters.take().into_iter().map(|(reason, count)| Notice::loss(reason, count)));
+                flush(&session, &id, &description, &mut number, &mut pending, &mut notices).await;
+                flush_at = None;
             }
+            () = exit.cancelled(), if closing_at.is_none() => { closing_at = Some(Instant::now() + TRAILING_OUTPUT_GRACE); }
             () = wait_until(closing_at) => break,
         }
     }
-
-    // Drain whatever the broadcast still buffers, then deliver the final lines
-    // and an exit notice so the agent learns the watch ended. A Lagged error is
-    // surfaced and skipped (matching the in-loop arm) rather than ending the
-    // drain early and dropping the chunks still queued behind it.
+    // The reader closes records after draining the tagged source and saving the
+    // partial diagnostic tail. A grace expiry still drains already framed rows.
     loop {
-        match rx.try_recv() {
-            Ok(chunk) => {
-                extend_lines(
-                    &mut buf,
-                    &chunk,
-                    &mut pending,
-                    &mut flood_count,
-                    &mut flush_at,
-                );
-            }
-            Err(TryRecvError::Lagged(skipped)) => {
-                flood_count += skipped as usize;
-                pending.push(format!(
-                    "(dropped ~{skipped} chunks: watcher output too fast)"
-                ));
-            }
-            Err(_) => break,
+        #[cfg(test)]
+        let record = match unbounded.as_mut() {
+            Some(rx) => rx.try_recv().ok(),
+            None => records.try_recv().ok(),
+        };
+        #[cfg(not(test))]
+        let record = records.try_recv().ok();
+        let Some(record) = record else {
+            break;
+        };
+        if record.attempt != committed {
+            continue;
+        }
+        #[cfg(test)]
+        let admitted = lossless || bucket.admit(std::time::Instant::now());
+        #[cfg(not(test))]
+        let admitted = bucket.admit(std::time::Instant::now());
+        if admitted {
+            pending.push(record);
+        } else {
+            counters.record(DropReason::Rate);
         }
     }
-    if !buf.is_empty() {
-        let text = String::from_utf8_lossy(&buf);
-        let text = text.trim_end();
-        if !text.is_empty() {
-            pending.push(text.to_string());
-        }
-    }
-    deliver_batch(&session, &description, &mut pending).await;
-    // Prune the registry BEFORE announcing the exit, so a turn the exit notice
-    // wakes (e.g. an `action=list`) already sees this watcher gone. A concurrent
-    // `action=stop` may have removed the entry first; this is then a no-op.
+    notices.extend(
+        counters
+            .take()
+            .into_iter()
+            .map(|(reason, count)| Notice::loss(reason, count)),
+    );
+    flush(
+        &session,
+        &id,
+        &description,
+        &mut number,
+        &mut pending,
+        &mut notices,
+    )
+    .await;
+    let partial = tail
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .and_then(|(attempt, tail)| (attempt == committed).then_some(tail));
+    notices.push(Notice::exit(partial));
     if let Some(session) = session.upgrade() {
         session.services.monitor_manager.deregister_self(&id).await;
     }
-    emit_notification(&session, &description, exit_notice(&process)).await;
-}
-
-/// Auto-stops a watcher that hit the flood ceiling: flush what we have, tell the
-/// agent, terminate the process, and prune the registry. Used by both the seed
-/// and the receive paths.
-async fn stop_for_flood(
-    session: &Weak<Session>,
-    description: &str,
-    id: &str,
-    process_id: i32,
-    pending: &mut Vec<String>,
-) {
-    deliver_batch(session, description, pending).await;
-    // Terminate and deregister before announcing, so the agent wakes to a
-    // consistent state.
-    if let Some(session) = session.upgrade() {
-        session
-            .services
-            .unified_exec_manager
-            .terminate_process(process_id)
-            .await;
-        session.services.monitor_manager.deregister_self(id).await;
-    }
-    emit_notification(
-        session,
-        description,
-        format!(
-            "auto-stopped after {FLOOD_MAX_LINES} lines (flood guard); \
-             restart with a tighter filter"
-        ),
+    flush(
+        &session,
+        &id,
+        &description,
+        &mut number,
+        &mut pending,
+        &mut notices,
     )
     .await;
 }
 
-/// Resolves at `deadline` when set, otherwise never.
+async fn flush(
+    session: &Weak<Session>,
+    id: &str,
+    description: &str,
+    number: &mut u64,
+    records: &mut Vec<Record>,
+    notices: &mut Vec<Notice>,
+) {
+    for body in render_notifications(id, description, *number, records, notices) {
+        *number = number.saturating_add(1);
+        let Some(session) = session.upgrade() else {
+            break;
+        };
+        session
+            .services
+            .monitor_manager
+            .deliver(
+                &session,
+                ContextualUserFragment::into(MonitorNotification::new(description, body)),
+            )
+            .await;
+    }
+    records.clear();
+    notices.clear();
+}
 async fn wait_until(deadline: Option<Instant>) {
     match deadline {
         Some(at) => sleep_until(at).await,
         None => std::future::pending().await,
     }
-}
-
-/// Splits `chunk` into complete lines, appending each to `pending` and arming
-/// the batch timer. Returns `true` if the flood ceiling was reached mid-chunk,
-/// so the caller can auto-stop before a single huge chunk blows past the bound.
-fn extend_lines(
-    buf: &mut Vec<u8>,
-    chunk: &[u8],
-    pending: &mut Vec<String>,
-    flood_count: &mut usize,
-    flush_at: &mut Option<Instant>,
-) -> bool {
-    buf.extend_from_slice(chunk);
-    loop {
-        let line: Vec<u8> = if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
-            buf.drain(..=nl).collect()
-        } else if buf.len() > MAX_LINE_BYTES {
-            // No newline yet, but the buffer is already pathologically long.
-            // Emit a truncated prefix so a newline-free stream cannot grow the
-            // buffer without bound; the remainder keeps draining on later passes,
-            // and each truncation counts toward the flood ceiling below.
-            let mut line: Vec<u8> = buf.drain(..MAX_LINE_BYTES).collect();
-            line.extend_from_slice(b" ... (line truncated)");
-            line
-        } else {
-            break;
-        };
-        let text = String::from_utf8_lossy(&line);
-        let text = text.trim_end();
-        if text.is_empty() {
-            continue;
-        }
-        pending.push(text.to_string());
-        *flood_count += 1;
-        if flush_at.is_none() {
-            *flush_at = Some(Instant::now() + BATCH_WINDOW);
-        }
-        if *flood_count >= FLOOD_MAX_LINES {
-            return true;
-        }
-    }
-    false
-}
-
-fn exit_notice(process: &UnifiedExecProcess) -> String {
-    if let Some(message) = process.failure_message() {
-        format!("watcher ended: {message}")
-    } else {
-        match process.exit_code() {
-            Some(code) => format!("watcher exited (code {code})"),
-            None => "watcher exited".to_string(),
-        }
-    }
-}
-
-/// Delivers the accumulated batch as one notification and clears it.
-async fn deliver_batch(session: &Weak<Session>, description: &str, pending: &mut Vec<String>) {
-    if pending.is_empty() {
-        return;
-    }
-    let text = std::mem::take(pending).join("\n");
-    emit_notification(session, description, text).await;
-}
-
-/// Records one notification, prefixed by the monitor's label.
-async fn emit_notification(session: &Weak<Session>, description: &str, body: String) {
-    let Some(session) = session.upgrade() else {
-        return;
-    };
-    let item = ContextualUserFragment::into(MonitorNotification::new(description, body));
-    session
-        .services
-        .monitor_manager
-        .deliver(&session, item)
-        .await;
 }
 
 #[cfg(test)]
@@ -708,3 +1132,7 @@ mod tests {
         handle.abort();
     }
 }
+
+#[cfg(test)]
+#[path = "monitor_pool_tests.rs"]
+mod monitor_pool_tests;

@@ -96,6 +96,7 @@ pub(crate) struct UnifiedExecProcess {
     state_tx: watch::Sender<ProcessState>,
     state_rx: watch::Receiver<ProcessState>,
     output_task: Option<JoinHandle<()>>,
+    pub(super) attempt: Option<super::monitor_frame::AttemptNonce>,
     sandbox_type: SandboxType,
     timed_out: AtomicBool,
     _spawn_lifecycle: Option<SpawnLifecycleHandle>,
@@ -137,6 +138,7 @@ impl UnifiedExecProcess {
             state_tx,
             state_rx,
             output_task: None,
+            attempt: None,
             sandbox_type,
             timed_out: AtomicBool::new(false),
             _spawn_lifecycle: spawn_lifecycle,
@@ -336,6 +338,40 @@ impl UnifiedExecProcess {
         Ok(())
     }
 
+    pub(super) async fn from_spawned_tagged(
+        spawned: SpawnedPty,
+        sandbox_type: SandboxType,
+        spawn_lifecycle: SpawnLifecycleHandle,
+        sink: tokio::sync::mpsc::Sender<super::monitor::TaggedChunk>,
+    ) -> Result<(Self, super::monitor_frame::AttemptNonce), UnifiedExecError> {
+        let SpawnedPty {
+            session: process_handle,
+            stdout_rx,
+            stderr_rx,
+            exit_rx,
+        } = spawned;
+        static NEXT_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let attempt =
+            super::monitor_frame::AttemptNonce::new(NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed));
+        let mut managed = Self::new(
+            ProcessHandle::Local(Box::new(process_handle)),
+            sandbox_type,
+            Some(spawn_lifecycle),
+        );
+        managed.output_task = Some(Self::spawn_local_output_task_tagged(
+            stdout_rx,
+            stderr_rx,
+            managed.output_handles().clone(),
+            managed.output_tx.clone(),
+            sink,
+            attempt,
+        ));
+        managed.attempt = Some(attempt);
+
+        let managed = managed.finish_local_spawn(exit_rx).await?;
+        Ok((managed, attempt))
+    }
+
     pub(super) async fn from_spawned(
         spawned: SpawnedPty,
         sandbox_type: SandboxType,
@@ -345,7 +381,7 @@ impl UnifiedExecProcess {
             session: process_handle,
             stdout_rx,
             stderr_rx,
-            mut exit_rx,
+            exit_rx,
         } = spawned;
         let output_rx = codex_utils_pty::combine_output_receivers(stdout_rx, stderr_rx);
         let mut managed = Self::new(
@@ -359,29 +395,38 @@ impl UnifiedExecProcess {
             managed.output_tx.clone(),
         ));
 
+        managed.finish_local_spawn(exit_rx).await
+    }
+
+    // Both local output consumers are installed before the shared immediate,
+    // grace-period, and asynchronous exit lifecycle inspects diagnostics.
+    async fn finish_local_spawn(
+        self,
+        mut exit_rx: tokio::sync::oneshot::Receiver<i32>,
+    ) -> Result<Self, UnifiedExecError> {
         match exit_rx.try_recv() {
             Ok(exit_code) => {
-                managed.signal_exit(Some(exit_code));
-                managed.check_for_sandbox_denial().await?;
-                return Ok(managed);
+                self.signal_exit(Some(exit_code));
+                self.check_for_sandbox_denial().await?;
+                return Ok(self);
             }
             Err(TryRecvError::Closed) => {
-                managed.signal_exit(/*exit_code*/ None);
-                managed.check_for_sandbox_denial().await?;
-                return Ok(managed);
+                self.signal_exit(/*exit_code*/ None);
+                self.check_for_sandbox_denial().await?;
+                return Ok(self);
             }
             Err(TryRecvError::Empty) => {}
         }
 
         if let Ok(exit_result) = tokio::time::timeout(EARLY_EXIT_GRACE_PERIOD, &mut exit_rx).await {
-            managed.signal_exit(exit_result.ok());
-            managed.check_for_sandbox_denial().await?;
-            return Ok(managed);
+            self.signal_exit(exit_result.ok());
+            self.check_for_sandbox_denial().await?;
+            return Ok(self);
         }
 
         tokio::spawn({
-            let state_tx = managed.state_tx.clone();
-            let cancellation_token = managed.output.cancellation_token.clone();
+            let state_tx = self.state_tx.clone();
+            let cancellation_token = self.output.cancellation_token.clone();
             async move {
                 let exit_code = exit_rx.await.ok();
                 let state = state_tx.borrow().clone();
@@ -390,7 +435,7 @@ impl UnifiedExecProcess {
             }
         });
 
-        Ok(managed)
+        Ok(self)
     }
 
     pub(super) async fn from_exec_server_started(
@@ -593,6 +638,50 @@ impl UnifiedExecProcess {
                         break;
                     }
                 }
+            }
+        })
+    }
+
+    fn spawn_local_output_task_tagged(
+        mut stdout_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        mut stderr_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        handles: OutputHandles,
+        output_tx: broadcast::Sender<Vec<u8>>,
+        sink: tokio::sync::mpsc::Sender<super::monitor::TaggedChunk>,
+        attempt: super::monitor_frame::AttemptNonce,
+    ) -> JoinHandle<()> {
+        use super::monitor_frame::Stream;
+        tokio::spawn(async move {
+            let _closed = OutputTaskGuard {
+                output_closed: Arc::clone(&handles.output_closed),
+                output_closed_notify: Arc::clone(&handles.output_closed_notify),
+            };
+            let mut stdout_open = true;
+            let mut stderr_open = true;
+            loop {
+                let (stream, bytes) = tokio::select! {
+                    chunk = stdout_rx.recv(), if stdout_open => match chunk {
+                        Some(bytes) => (Stream::Stdout, bytes),
+                        None => { stdout_open = false; continue; }
+                    },
+                    chunk = stderr_rx.recv(), if stderr_open => match chunk {
+                        Some(bytes) => (Stream::Stderr, bytes),
+                        None => { stderr_open = false; continue; }
+                    },
+                    else => break,
+                };
+                // Diagnostics are written before the awaited tagged handoff.
+                handles.output_buffer.lock().await.push_chunk(&bytes);
+                handles.output_notify.notify_waiters();
+                let _ = output_tx.send(bytes.clone());
+                // A dropped pipeline must never stop diagnostic ingestion.
+                let _ = sink
+                    .send(super::monitor::TaggedChunk {
+                        attempt,
+                        stream,
+                        bytes,
+                    })
+                    .await;
             }
         })
     }

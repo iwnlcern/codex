@@ -111,6 +111,7 @@ mod model_visible_layout;
 mod models_cache_ttl;
 mod models_etag_responses;
 mod monitor;
+mod monitor_pool;
 mod multi_agent_mode;
 mod multi_agent_resume;
 #[cfg(unix)]

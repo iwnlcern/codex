@@ -11,8 +11,9 @@ use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use crate::unified_exec::ExecCommandRequest;
+use crate::unified_exec::MonitorPipeline;
 use crate::unified_exec::UnifiedExecContext;
-use crate::unified_exec::spawn_delivery;
+use crate::unified_exec::UnifiedExecOutputMode;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolName;
@@ -154,12 +155,7 @@ async fn handle_call(
                 ));
             };
             let message = match session.services.monitor_manager.remove(&id).await {
-                Some(process_id) => {
-                    session
-                        .services
-                        .unified_exec_manager
-                        .terminate_process(process_id)
-                        .await;
+                Some(_) => {
                     format!("Stopped monitor {id}.")
                 }
                 None => format!("No active monitor with id {id}."),
@@ -202,7 +198,6 @@ async fn start(
             )
         })?;
 
-    let manager = &session.services.unified_exec_manager;
     let context = UnifiedExecContext::new(
         session.clone(),
         Arc::clone(&step_context),
@@ -250,12 +245,13 @@ async fn start(
     )
     .map_err(FunctionCallError::RespondToModel)?;
 
-    let process_id = manager.allocate_process_id().await;
+    let (pipeline, sink) = MonitorPipeline::new();
     let request = ExecCommandRequest {
+        output_mode: UnifiedExecOutputMode::Tagged { sink },
         command: resolved.command,
         shell_type: resolved.shell_type,
         hook_command: command.clone(),
-        process_id,
+        process_id: 0,
         yield_time_ms: MONITOR_YIELD_MS,
         max_output_tokens: None,
         cwd: cwd.clone(),
@@ -271,42 +267,14 @@ async fn start(
         prefix_rule: None,
     };
 
-    let initial_output = match manager.exec_command(request, &context).await {
-        Ok(output) => output,
-        Err(err) => {
-            manager.release_process_id(process_id).await;
-            return Err(FunctionCallError::RespondToModel(format!(
-                "failed to start monitor: {err:?}"
-            )));
-        }
-    };
-
-    // The delivery loop subscribes to the process output stream only inside
-    // `spawn_delivery`, and the broadcast does not replay to a late subscriber.
-    // Seed it with whatever the initial yield already captured so the first
-    // lines (a banner, an already-matching grep) are not dropped.
-    let id = format!("mon_{}", uuid::Uuid::new_v4());
-    let Some(task) = spawn_delivery(
-        manager,
-        process_id,
-        id.clone(),
-        Arc::downgrade(session),
-        description.clone(),
-        initial_output.raw_output,
-    )
-    .await
-    else {
-        return Err(FunctionCallError::RespondToModel(
-            "command exited immediately; a monitor command must keep running and print events"
-                .to_string(),
-        ));
-    };
-
-    session
+    let id = session
         .services
         .monitor_manager
-        .insert(id.clone(), process_id, description.clone(), command, task)
-        .await;
+        .start_with_pipeline(session, &context, request, description.clone(), pipeline)
+        .await
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!("failed to start monitor: {error}"))
+        })?;
     Ok(text_output(format!(
         "Started monitor {id}: watching \"{description}\". Stop it with action=stop, id={id}."
     )))

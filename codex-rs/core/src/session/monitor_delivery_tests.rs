@@ -215,6 +215,15 @@ impl Fixture {
     }
 
     async fn monitor(&self, arguments: serde_json::Value) {
+        self.monitor_result(arguments)
+            .await
+            .expect("real monitor operation");
+    }
+
+    async fn monitor_result(
+        &self,
+        arguments: serde_json::Value,
+    ) -> Result<(), codex_tools::FunctionCallError> {
         let cancellation_token = CancellationToken::new();
         let step_context = self
             .session
@@ -236,7 +245,7 @@ impl Fixture {
                 },
             })
             .await
-            .expect("real monitor operation");
+            .map(|_| ())
     }
 
     async fn close(&self) {
@@ -868,6 +877,7 @@ async fn record_never_resubmitted() {
     clippy::await_holding_invalid_type,
     reason = "the test holds the real start_task mutex to witness cancellation after reservation"
 )]
+#[expect(clippy::print_stderr, reason = "retained stage-specific gate evidence")]
 async fn concurrent_start_stop_shutdown_completes_under_5s() {
     let f = Fixture::new().await;
     f.monitor(serde_json::json!({"action":"start", "description":"existing watcher", "command":"sleep 60"})).await;
@@ -892,10 +902,10 @@ async fn concurrent_start_stop_shutdown_completes_under_5s() {
     let delivery = start_delivery(&f.session, "CONCURRENT_RECORD");
     rendezvous(&before).await;
     timeout(LIMIT, async {
-        let start_a = f.monitor(
+        let start_a = f.monitor_result(
             serde_json::json!({"action":"start", "description":"race a", "command":"sleep 60"}),
         );
-        let start_b = f.monitor(
+        let start_b = f.monitor_result(
             serde_json::json!({"action":"start", "description":"race b", "command":"sleep 60"}),
         );
         let stop = f.monitor(serde_json::json!({"action":"stop", "id":existing}));
@@ -904,7 +914,19 @@ async fn concurrent_start_stop_shutdown_completes_under_5s() {
             rendezvous(&before).await;
             delivery.await.unwrap();
         };
-        tokio::join!(start_a, start_b, stop, shutdown, release);
+        let (a, b, (), (), ()) = tokio::join!(start_a, start_b, stop, shutdown, release);
+        for result in [a, b] {
+            if let Err(error) = result {
+                let codex_tools::FunctionCallError::RespondToModel(message) = error else { panic!("unexpected raced start failure: {error:?}"); };
+                assert!(!message.contains("eight monitors already reserved"), "raced shutdown must not report capacity: {message}");
+                assert!([
+                    "failed to start monitor: Unified exec process failed: monitor preparation cancelled",
+                    "failed to start monitor: Unified exec process failed: monitor start cancelled before registration",
+                    "failed to start monitor: Unified exec process failed: session stopped",
+                ].contains(&message.as_str()), "unexpected raced start result: {message}");
+                eprintln!("raced start cancelled by shutdown: {message}");
+            }
+        }
     })
     .await
     .expect("two starts, stop, shutdown and in-flight delivery finish within 5s");
@@ -951,10 +973,10 @@ async fn concurrent_start_stop_shutdown_completes_under_5s() {
                 .as_ref()
                 .is_some_and(|turn| turn.task.is_none())
         );
-        let start_a = f.monitor(
+        let start_a = f.monitor_result(
             serde_json::json!({"action":"start", "description":"reserved a", "command":"sleep 60"}),
         );
-        let start_b = f.monitor(
+        let start_b = f.monitor_result(
             serde_json::json!({"action":"start", "description":"reserved b", "command":"sleep 60"}),
         );
         let stop = f.monitor(serde_json::json!({"action":"stop", "id":existing}));
@@ -962,7 +984,19 @@ async fn concurrent_start_stop_shutdown_completes_under_5s() {
             drop(start_guard);
             delivery.await.unwrap();
         };
-        tokio::join!(start_a, start_b, stop, shutdown, release);
+        let (a, b, (), (), ()) = tokio::join!(start_a, start_b, stop, shutdown, release);
+        for result in [a, b] {
+            if let Err(error) = result {
+                let codex_tools::FunctionCallError::RespondToModel(message) = error else { panic!("unexpected raced start failure: {error:?}"); };
+                assert!(!message.contains("eight monitors already reserved"), "raced shutdown must not report capacity: {message}");
+                assert!([
+                    "failed to start monitor: Unified exec process failed: monitor preparation cancelled",
+                    "failed to start monitor: Unified exec process failed: monitor start cancelled before registration",
+                    "failed to start monitor: Unified exec process failed: session stopped",
+                ].contains(&message.as_str()), "unexpected raced start result: {message}");
+                eprintln!("raced start cancelled by shutdown: {message}");
+            }
+        }
     })
     .await
     .expect("reserved admission and lifecycle operations quiesce within 5s");

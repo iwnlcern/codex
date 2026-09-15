@@ -60,7 +60,7 @@ mod shell_snapshot;
 mod stdin_approval;
 
 pub(crate) use monitor::MonitorManager;
-pub(crate) use monitor::spawn_delivery;
+pub(crate) use monitor::MonitorPipeline;
 
 pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
     process_manager::set_deterministic_process_ids_for_tests(enabled);
@@ -109,8 +109,17 @@ impl UnifiedExecContext {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum UnifiedExecOutputMode {
+    Combined,
+    Tagged {
+        sink: tokio::sync::mpsc::Sender<monitor::TaggedChunk>,
+    },
+}
+
 #[derive(Debug)]
 pub(crate) struct ExecCommandRequest {
+    pub output_mode: UnifiedExecOutputMode,
     pub command: Vec<String>,
     pub shell_type: ShellType,
     pub hook_command: String,
@@ -244,3 +253,9 @@ mod process_tests;
 #[cfg(unix)]
 #[path = "mod_tests.rs"]
 mod tests;
+
+impl UnifiedExecError {
+    pub(crate) fn unsupported(reason: &str) -> Self {
+        Self::process_failed(format!("unavailable: {reason}"))
+    }
+}
