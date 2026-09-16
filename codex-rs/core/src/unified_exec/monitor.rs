@@ -15,6 +15,8 @@ use super::process::UnifiedExecProcess;
 use crate::context::ContextualUserFragment;
 use crate::context::MonitorNotification;
 use crate::session::session::Session;
+use chrono::DateTime;
+use chrono::Utc;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::turn_input::TurnInput as SubmittedTurnInput;
 use codex_protocol::turn_input::TurnInputSubmission;
@@ -37,10 +39,12 @@ pub(crate) struct MonitorInfo {
     pub id: String,
     pub description: String,
     pub command: String,
+    pub started_at: DateTime<Utc>,
 }
 struct MonitorRecord {
     description: String,
     command: String,
+    started_at: DateTime<Utc>,
     process_id: i32,
     process: Option<MonitorProcess>,
     pipeline: Option<MonitorPipeline>,
@@ -467,6 +471,7 @@ impl MonitorManager {
             MonitorRecord {
                 description: description.clone(),
                 command,
+                started_at: Utc::now(),
                 process_id: 0,
                 process: Some(process),
                 pipeline: Some(pipeline),
@@ -515,6 +520,7 @@ impl MonitorManager {
             MonitorRecord {
                 description,
                 command,
+                started_at: Utc::now(),
                 process_id,
                 process: None,
                 pipeline: None,
@@ -604,6 +610,7 @@ impl MonitorManager {
                 id: id.clone(),
                 description: record.description.clone(),
                 command: record.command.clone(),
+                started_at: record.started_at,
             })
             .collect()
     }

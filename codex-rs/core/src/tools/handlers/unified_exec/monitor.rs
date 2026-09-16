@@ -26,6 +26,7 @@ use super::get_command;
 use super::shell_mode_for_environment;
 
 const MONITOR_TOOL_NAME: &str = "monitor";
+const MAX_DESCRIPTION_BYTES: usize = 256;
 
 /// Time the spawn blocks for initial output before returning. Kept short so the
 /// tool call returns quickly while the watcher keeps running in the background.
@@ -169,7 +170,15 @@ async fn handle_call(
             } else {
                 monitors
                     .iter()
-                    .map(|m| format!("{}  [{}]  {}", m.id, m.description, m.command))
+                    .map(|m| {
+                        format!(
+                            "{}  [{}]  {}  started-at={}",
+                            m.id,
+                            m.description,
+                            m.command,
+                            m.started_at.to_rfc3339()
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("\n")
             };
@@ -197,6 +206,11 @@ async fn start(
                 "action=start requires a non-empty `description`".to_string(),
             )
         })?;
+    if description.len() > MAX_DESCRIPTION_BYTES {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "action=start requires `description` to be at most {MAX_DESCRIPTION_BYTES} bytes"
+        )));
+    }
 
     let context = UnifiedExecContext::new(
         session.clone(),
