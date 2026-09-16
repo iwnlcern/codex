@@ -1233,17 +1233,20 @@ async fn wait_until(deadline: Option<Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[tokio::test]
     async fn registry_tracks_insert_list_and_remove() {
         let manager = MonitorManager::new();
+        let task = tokio::spawn(std::future::pending::<()>());
+        let handle = task.abort_handle();
         manager
             .insert(
                 "mon_a".to_string(),
                 1,
                 "watch a".to_string(),
                 "cmd a".to_string(),
-                tokio::spawn(async {}),
+                task,
             )
             .await;
         manager
@@ -1261,6 +1264,7 @@ mod tests {
         // `remove` returns the process id so the caller can terminate it; a
         // second remove of the same id is a no-op.
         assert_eq!(manager.remove("mon_a").await, Some(1));
+        assert!(handle.is_finished(), "remove must join the aborted task");
         assert_eq!(manager.remove("mon_a").await, None);
 
         let remaining = manager.list().await;
@@ -1303,6 +1307,9 @@ mod tests {
         assert!(manager.list().await.is_empty());
 
         handle.abort();
+        manager.abort_all().await;
+        assert!(handle.is_finished(), "shutdown joins the self-pruned task");
+        assert!(manager.cleanups.is_empty(), "cleanup ownership is drained");
     }
 }
 

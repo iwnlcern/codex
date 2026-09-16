@@ -363,7 +363,7 @@ async fn exit_while_refused_then_mode_change_still_wakes() {
     f.mode(ModeKind::Default).await;
     f.complete().await;
     assert_eq!(copies(&prompt, "EXIT_RECORD"), 1);
-    assert_eq!(copies(&prompt, "watcher exited"), 1);
+    assert_eq!(copies(&prompt, "MONITOR-NOTICE: exit"), 1);
     f.close().await;
 }
 
