@@ -199,7 +199,7 @@ print('exact 69 identities: '+sys.argv[1])
 PY
 }
 test_head() (
-    local head dir out target rc=0 guard=0
+    local head dir out target junit rc=0 guard=0
     head=$(sha "$1")
     structural "$head" || exit 3
     out="${MONITOR_REBASE_RESULTS:-$STORE/results/v295-codex-fork/impl}/$head"
@@ -224,18 +224,20 @@ test_head() (
     mkdir -p "$target"
     target=$(cd "$target" && pwd)
     export CARGO_TARGET_DIR="$target"
+    # Nextest's default store is workspace-relative, independent of Cargo's cache.
+    junit="$PWD/codex-rs/target/nextest/local/junit.xml"
     cd codex-rs
     cargo nextest list -p codex-core -E 'test(monitor)' --message-format json > "$out/list.json" 2> "$out/list.stderr" || rc=$?
     cd ..
     python3 scripts/lockfile-delta.py "$out/Cargo.lock.before" codex-rs/Cargo.lock > "$out/lock-list.txt" || exit 1
     [[ $rc == 0 ]] || exit 1
     receipt_check list "$out/list.json"
-    rm -f "$target/nextest/local/junit.xml"
+    rm -f "$junit"
     (cd codex-rs; just test -p codex-core -E 'test(monitor)' --retries 0) > "$out/run.log" 2>&1 || rc=$?
     cat "$out/run.log"
     python3 scripts/lockfile-delta.py "$out/Cargo.lock.before" codex-rs/Cargo.lock > "$out/lock-monitor.txt" || exit 1
-    [[ -f $target/nextest/local/junit.xml ]] || exit 1
-    cp "$target/nextest/local/junit.xml" "$out/junit.xml"
+    [[ -f $junit ]] || exit 1
+    cp "$junit" "$out/junit.xml"
     [[ $rc == 0 ]] || exit 1
     receipt_check junit "$out/junit.xml"
     (cd codex-rs; just test -p codex-features --retries 0) > "$out/features.log" 2>&1 || rc=$?

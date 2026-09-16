@@ -100,8 +100,27 @@ actual={str(p.relative_to(root)):p.read_bytes().hex() for p in root.rglob('*') i
 assert actual==json.loads(pathlib.Path(sys.argv[2]).read_text()), 'failed receipt bytes changed'
 PY
     pass listing_failure_receipt_is_exclusively_preserved
-    expect_status 0 "$EVIDENCE/clean-test.log" bash "$SCRIPT" test "$head"
+    # This clean-head run also discriminates workspace-local JUnit from a shared
+    # external Cargo build cache; it is not a separate plain-target witness.
+    shared_target=${CARGO_TARGET_DIR:-$FIXTURE/shared-build-cache}
+    mkdir -p "$shared_target"
+    shared_target=$(cd "$shared_target" && pwd)
+    expect_status 0 "$EVIDENCE/clean-test.log" env CARGO_TARGET_DIR="$shared_target" bash "$SCRIPT" test "$head"
     pass test_passes_on_clean_head
+    python3 - "$MONITOR_REBASE_RESULTS/$head" "$shared_target" <<'PY'
+import json,pathlib,sys,xml.etree.ElementTree as ET
+receipt=pathlib.Path(sys.argv[1]); shared=pathlib.Path(sys.argv[2]).resolve()
+listing=json.loads((receipt/'list.json').read_text())
+workspace=pathlib.Path(listing['rust-suites']['codex-core']['cwd']).parent.resolve()
+assert pathlib.Path(listing['rust-build-meta']['target-directory']).resolve()==shared
+assert not shared.is_relative_to(workspace), 'cache must be outside candidate workspace'
+selected={(binary,name) for binary,suite in listing['rust-suites'].items() for name,t in suite['testcases'].items() if t['filter-match']['status']=='matches'}
+cases=list(ET.parse(receipt/'junit.xml').iter('testcase'))
+actual=[(t.attrib['classname'],t.attrib['name']) for t in cases]
+assert len(actual)==len(set(actual))==len(selected)==69 and set(actual)==selected
+assert all(t.find(kind) is None for t in cases for kind in ('failure','error','skipped'))
+PY
+    pass shared_external_cache_preserves_receipt_copy_and_identity
     [[ $(bash "$SCRIPT" carried "$TAG") == yes ]]
     pass carried_yes_when_main_parent_is_tag
     git update-ref refs/heads/main "$(git rev-parse "$TAG^{commit}")"
