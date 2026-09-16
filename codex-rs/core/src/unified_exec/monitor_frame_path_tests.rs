@@ -21,6 +21,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::sleep;
 use tokio::time::timeout;
+use tokio::time::timeout_at;
 use tokio_util::sync::CancellationToken;
 
 const LIMIT: Duration = Duration::from_secs(5);
@@ -284,9 +285,63 @@ async fn drop_then_2s_silence_emits_notice() {
             "python3 -c 'import os,time; os.write(1, b\"x\"*4097+b\"\\n\"); time.sleep(30)'",
         )
         .await;
-        let began = Instant::now();
-        let text = observed(&model, "MONITOR-NOTICE: loss oversize records=1;").await;
-        assert!(began.elapsed() >= Duration::from_millis(1500));
+        let probe = probe();
+        let handshake_budget = Duration::from_secs(5);
+        let notice_budget = Duration::from_secs(5);
+        let quiet_interval = Duration::from_secs(2);
+        timeout(handshake_budget, async {
+            while probe.producer_activity_at.lock().unwrap().is_none() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("actual committed producer activity within handshake budget");
+        // A child write can span several transport chunks. Resample P until
+        // emission, then require the exact origin selected by the real timer.
+        let (producer_at, emitted_at) = loop {
+            let producer_at = probe.producer_activity_at.lock().unwrap().unwrap();
+            if let Some(emitted_at) = *probe.silence_notice_emitted_at.lock().unwrap() {
+                break (producer_at, emitted_at);
+            }
+            assert!(
+                tokio::time::Instant::now()
+                    <= tokio::time::Instant::from_std(producer_at) + quiet_interval + notice_budget,
+                "silence notice emission exceeded producer-relative deadline"
+            );
+            sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(probe.silence_timer_origin(), Some(producer_at));
+        assert!(
+            emitted_at <= producer_at + quiet_interval + notice_budget,
+            "silence notice emitted after producer-relative deadline"
+        );
+        assert!(
+            emitted_at.duration_since(producer_at) >= quiet_interval,
+            "silence notice emitted before two seconds of producer silence"
+        );
+        let text = timeout_at(
+            tokio::time::Instant::from_std(producer_at) + quiet_interval + notice_budget,
+            async {
+                loop {
+                    let text = model_text(&model);
+                    if text.contains("MONITOR-NOTICE: loss oversize records=1;") {
+                        break text;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await
+        .expect("recorded loss notice within producer-relative deadline");
+        assert!(
+            tokio::time::Instant::now()
+                <= tokio::time::Instant::from_std(producer_at) + quiet_interval + notice_budget,
+            "model observation exceeded producer-relative deadline"
+        );
+        assert_eq!(
+            *probe.producer_activity_at.lock().unwrap(),
+            Some(producer_at)
+        );
         assert!(text.contains(REPLAY_INSTRUCTION));
         assert!(!text.contains("MONITOR-NOTICE: exit"));
         assert!(

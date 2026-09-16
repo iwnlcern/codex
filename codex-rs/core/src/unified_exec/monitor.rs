@@ -771,6 +771,9 @@ pub(crate) struct PipelineHooks {
 #[cfg(test)]
 pub(crate) struct PipelinePathProbe {
     pub(crate) ledger: Arc<LossLedger>,
+    pub(crate) producer_activity_at: std::sync::Mutex<Option<std::time::Instant>>,
+    pub(crate) silence_notice_emitted_at: std::sync::Mutex<Option<std::time::Instant>>,
+    observation: std::sync::Mutex<ProducerObservation>,
     reader: tokio::task::AbortHandle,
     pub(crate) collected: std::sync::Mutex<Vec<Record>>,
     hold_receive: std::sync::atomic::AtomicBool,
@@ -783,8 +786,21 @@ pub(crate) struct PipelinePathProbe {
     released: tokio::sync::Notify,
     full_at: std::sync::Mutex<std::time::Instant>,
 }
+// Retain actual pushes across reader-before-commit ordering; never infer an
+// observation from a freshly constructed counter. Commit prunes rejected attempts.
+#[cfg(test)]
+#[derive(Default)]
+struct ProducerObservation {
+    committed: Option<AttemptNonce>,
+    actual_by_attempt: HashMap<AttemptNonce, std::time::Instant>,
+    emitted_timer_origin: Option<std::time::Instant>,
+}
 #[cfg(test)]
 impl PipelinePathProbe {
+    pub(crate) fn silence_timer_origin(&self) -> Option<std::time::Instant> {
+        self.observation.lock().unwrap().emitted_timer_origin
+    }
+
     // Hold only normal receipt: the real child exit and grace timer must drive
     // the existing final drain, whose receiver and counter collection remain real.
     pub(crate) fn hold_receive_for_final_loss(&self) {
@@ -901,6 +917,8 @@ impl MonitorPipeline {
         } else {
             (output, None)
         };
+        #[cfg(test)]
+        let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
         let reader = spawn_reader_with_state(
             tagged_rx,
             Arc::clone(&ledger),
@@ -908,9 +926,31 @@ impl MonitorPipeline {
             Arc::clone(&tail),
             #[cfg(test)]
             hooks.reader_gate,
+            #[cfg(test)]
+            Some(probe_rx),
         );
         #[cfg(test)]
         let reader_handle = reader.abort_handle();
+        #[cfg(test)]
+        let path_probe = Arc::new(PipelinePathProbe {
+            ledger: Arc::clone(&ledger),
+            producer_activity_at: std::sync::Mutex::new(None),
+            silence_notice_emitted_at: std::sync::Mutex::new(None),
+            observation: std::sync::Mutex::new(ProducerObservation::default()),
+            reader: reader_handle,
+            collected: std::sync::Mutex::new(Vec::new()),
+            hold_receive: std::sync::atomic::AtomicBool::new(false),
+            final_loss_parked: std::sync::atomic::AtomicBool::new(false),
+            final_loss_released: tokio::sync::Notify::new(),
+            requested: std::sync::atomic::AtomicBool::new(false),
+            parked: std::sync::atomic::AtomicBool::new(false),
+            remaining: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            changed: tokio::sync::Notify::new(),
+            released: tokio::sync::Notify::new(),
+            full_at: std::sync::Mutex::new(std::time::Instant::now()),
+        });
+        #[cfg(test)]
+        assert!(probe_tx.send(Arc::clone(&path_probe)).is_ok());
         (
             Self {
                 reader,
@@ -925,26 +965,25 @@ impl MonitorPipeline {
                 #[cfg(test)]
                 lossless: hooks.lossless_downstream,
                 #[cfg(test)]
-                path_probe: Arc::new(PipelinePathProbe {
-                    ledger: Arc::clone(&ledger),
-                    reader: reader_handle,
-                    collected: std::sync::Mutex::new(Vec::new()),
-                    hold_receive: std::sync::atomic::AtomicBool::new(false),
-                    final_loss_parked: std::sync::atomic::AtomicBool::new(false),
-                    final_loss_released: tokio::sync::Notify::new(),
-                    requested: std::sync::atomic::AtomicBool::new(false),
-                    parked: std::sync::atomic::AtomicBool::new(false),
-                    remaining: std::sync::atomic::AtomicUsize::new(usize::MAX),
-                    changed: tokio::sync::Notify::new(),
-                    released: tokio::sync::Notify::new(),
-                    full_at: std::sync::Mutex::new(std::time::Instant::now()),
-                }),
+                path_probe,
             },
             sink,
         )
     }
     pub(crate) fn commit(&self, attempt: AttemptNonce) -> Arc<LossCounters> {
-        self.ledger.commit(attempt)
+        #[cfg(test)]
+        let mut observation = self.path_probe.observation.lock().unwrap();
+        let counters = self.ledger.commit(attempt);
+        #[cfg(test)]
+        {
+            observation.committed = Some(attempt);
+            observation
+                .actual_by_attempt
+                .retain(|nonce, _| *nonce == attempt);
+            *self.path_probe.producer_activity_at.lock().unwrap() =
+                observation.actual_by_attempt.get(&attempt).copied();
+        }
+        counters
     }
 }
 impl Drop for MonitorPipeline {
@@ -980,6 +1019,8 @@ pub(crate) fn spawn_reader(
         Arc::new(std::sync::Mutex::new(None)),
         #[cfg(test)]
         None,
+        #[cfg(test)]
+        None,
     )
 }
 
@@ -989,8 +1030,14 @@ fn spawn_reader_with_state(
     output: RecordOutput,
     tail: Tail,
     #[cfg(test)] reader_gate: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(test)] probe_rx: Option<tokio::sync::oneshot::Receiver<Arc<PipelinePathProbe>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        #[cfg(test)]
+        let path_probe = match probe_rx {
+            Some(receiver) => Some(receiver.await.expect("pipeline observer initialized")),
+            None => None,
+        };
         #[cfg(test)]
         if let Some(gate) = reader_gate {
             gate.notified().await;
@@ -1005,7 +1052,21 @@ fn spawn_reader_with_state(
                 framer = RecordFramer::new(attempt);
                 counters = ledger.for_attempt(attempt);
             }
-            for record in framer.push(chunk.stream, &chunk.bytes, &counters) {
+            let framed = framer.push(chunk.stream, &chunk.bytes, &counters);
+            #[cfg(test)]
+            if let Some(probe) = &path_probe {
+                // Lock order is observation -> producer timestamp; counter locks
+                // never remain held while acquiring either observation lock.
+                let activity = *counters.last_activity.lock().unwrap();
+                let mut observation = probe.observation.lock().unwrap();
+                if observation.committed.is_none() || observation.committed == Some(attempt) {
+                    observation.actual_by_attempt.insert(attempt, activity);
+                    if observation.committed == Some(attempt) {
+                        *probe.producer_activity_at.lock().unwrap() = Some(activity);
+                    }
+                }
+            }
+            for record in framed {
                 if !output.send(record) {
                     counters.record(DropReason::ChannelFull);
                 }
@@ -1051,17 +1112,21 @@ async fn delivery_loop(
     loop {
         #[cfg(test)]
         path_probe.checkpoint(&bucket).await;
+        #[cfg(test)]
+        let mut selected_origin = None;
         let loss_at = counters
             .gap_open
             .load(std::sync::atomic::Ordering::Acquire)
             .then(|| {
-                Instant::from_std(
-                    *counters
-                        .last_activity
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        + Duration::from_secs(2),
-                )
+                let activity = *counters
+                    .last_activity
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                #[cfg(test)]
+                {
+                    selected_origin = Some(activity);
+                }
+                Instant::from_std(activity + Duration::from_secs(2))
             });
         let received = async {
             #[cfg(test)]
@@ -1115,6 +1180,11 @@ async fn delivery_loop(
                 flush_at = None;
             }
             () = wait_until(loss_at) => {
+                #[cfg(test)]
+                {
+                    path_probe.observation.lock().unwrap().emitted_timer_origin = selected_origin;
+                    *path_probe.silence_notice_emitted_at.lock().unwrap() = Some(std::time::Instant::now());
+                }
                 notices.extend(counters.take().into_iter().map(|(reason, count)| Notice::loss(reason, count)));
                 flush(&session, &id, &description, &mut number, &mut pending, &mut notices).await;
                 flush_at = None;
