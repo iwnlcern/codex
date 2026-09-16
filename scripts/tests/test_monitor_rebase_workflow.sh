@@ -61,7 +61,7 @@ case_run discover_skips_carried_tag 0 bash "$SCRIPT" transition discover --tag "
 [[ $(cat "$GH_FIXTURE") == '{}' ]]
 pass discover_skips_carried_tag
 # A controlled stable tag, one empty-tree commit newer than the carried upstream.
-newbase=$(printf 'simulated upstream\n' | git commit-tree "$TAG^{tree}" -p "$TAG")
+newbase=$(printf 'simulated upstream\n' | git commit-tree "$TAG^{tree}" -p "$TAG^{commit}")
 newtag=rust-v0.154.1
 git tag "$newtag" "$newbase"
 git push origin "refs/tags/$newtag"
@@ -70,7 +70,7 @@ head=$(remote_head "refs/heads/rebase/$newtag")
 assert_body "$newtag" clean "$head"
 pass discover_creates_pr_for_simulated_new_tag
 # Fail the real cargo invocation deliberately; do not counterfeit a JUnit receipt.
-failedbase=$(printf 'simulated failing upstream\n' | git commit-tree "$TAG^{tree}" -p "$TAG")
+failedbase=$(printf 'simulated failing upstream\n' | git commit-tree "$TAG^{tree}" -p "$TAG^{commit}")
 failedtag=rust-v0.154.2
 git tag "$failedtag" "$failedbase"
 git push origin "refs/tags/$failedtag"

@@ -46,7 +46,7 @@ with_file() {
     GIT_INDEX_FILE="$idx" git update-index --add --cacheinfo "100644,$blob,$path"
     tree=$(GIT_INDEX_FILE="$idx" git write-tree)
     rm "$idx"
-    printf 'scratch fixture %s\n' "$path" | git commit-tree "$tree" -p "$parent"
+    printf 'scratch fixture %s\n' "$path" | git commit-tree "$tree" -p "$parent^{commit}"
 }
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     fixture "$@"
@@ -75,6 +75,8 @@ PY
     [[ $(grep -c '^codex-rs/' "$conflicted/REBASE-REPORT.md") == 8 ]]
     pass report_summarizes_conflicts
     bad=$(with_file "$SQ" "$TAG" REBASE-REPORT.md 'unresolved')
+    [[ $(git rev-parse "$bad^") == "$(git rev-parse "$TAG^{commit}")" ]]
+    pass constructed_fixture_parent_is_peeled_tag
     expect_status 3 "$EVIDENCE/ineligible.log" bash "$SCRIPT" test "$bad"
     pass test_refuses_ineligible_head
     # A listing-stage failure reserves its directory before any receipt write.
@@ -102,7 +104,7 @@ PY
     pass test_passes_on_clean_head
     [[ $(bash "$SCRIPT" carried "$TAG") == yes ]]
     pass carried_yes_when_main_parent_is_tag
-    git update-ref refs/heads/main "$TAG"
+    git update-ref refs/heads/main "$(git rev-parse "$TAG^{commit}")"
     [[ $(bash "$SCRIPT" carried "$TAG") == no ]]
     pass carried_no_otherwise
     git update-ref refs/heads/main "$SQ"
