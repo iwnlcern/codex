@@ -37,6 +37,65 @@ expect_status() {
     cat "$log"
     [[ $rc == "$expected" ]] || { echo "expected $expected, got $rc" >&2; exit 1; }
 }
+# Verify the tested candidate independently of transition exit/publication success.
+assert_receipt() {
+    python3 - "$MONITOR_REBASE_RESULTS" "$1" "$2" <<'PY'
+import hashlib,json,pathlib,re,sys,xml.etree.ElementTree as ET
+root=pathlib.Path(sys.argv[1]); state,head=sys.argv[2:]
+def require(ok,reason):
+    if not ok: raise SystemExit('receipt assertion: '+reason)
+require(re.fullmatch('[0-9a-f]{40}',head), 'invalid expected head')
+require(root.is_dir() and sorted(p.name for p in root.iterdir())==[head], 'missing or extra candidate receipt')
+p=root/head
+try:
+    d=json.loads((p/'receipt-state.json').read_text())
+    require(d['state']==state and d['head']==head, 'wrong state or stale head')
+    require(set(d)=={'state','head','monitor','features','failure'} | ({'tested-head'} if state=='clean' else set()), 'malformed state keys')
+    require((p/'head').read_text().strip()==head, 'head file mismatch')
+    m=d['monitor']
+    require(set(m)=={'inventory','run','identity-failure','junit-sha256'}, 'malformed monitor proof')
+    require(all(m[k] in ('passed','failed','not-run') for k in ('inventory','run','identity-failure')), 'invalid monitor verdict')
+    require(d['features'] in ('passed','failed','not-run'), 'invalid features verdict')
+    junit=p/'junit.xml'
+    if junit.exists():
+        require(m['junit-sha256']==hashlib.sha256(junit.read_bytes()).hexdigest(), 'JUnit digest mismatch')
+    else:
+        require(m['junit-sha256'] is None and m['identity-failure']=='not-run', 'invented JUnit proof')
+    if m['inventory']!='passed':
+        require(all(m[k]=='not-run' for k in ('run','identity-failure')) and d['features']=='not-run', 'execution after failed inventory')
+    if m['run']=='not-run':
+        require(not junit.exists() and m['identity-failure']=='not-run', 'JUnit proof without monitor run')
+    if m['identity-failure']!='not-run':
+        require(junit.is_file() and m['run']!='not-run', 'identity verdict without JUnit')
+    if m['run']!='passed' or m['identity-failure']!='passed':
+        require(d['features']=='not-run', 'features executed before monitor success')
+    if m['identity-failure']=='passed':
+        listed=[]
+        for binary,suite in json.loads((p/'list.json').read_text())['rust-suites'].items():
+            for name,t in suite['testcases'].items():
+                if t['filter-match']['status']=='matches':
+                    require(not t['ignored'], 'ignored inventory member')
+                    require(binary==('codex-core::all' if name.startswith('suite::') else 'codex-core'), 'wrong inventory binary')
+                    listed.append((binary,name))
+        cases=[]
+        for t in ET.parse(junit).getroot().iter('testcase'):
+            require(not any(t.find(k) is not None for k in ('failure','error','skipped')), 'failed or skipped JUnit member')
+            cases.append((t.attrib['classname'],t.attrib['name']))
+        require(len(listed)==len(set(listed))==len(cases)==len(set(cases))==69 and set(listed)==set(cases), 'inventory/JUnit mismatch')
+    if d['features']!='not-run':
+        require((p/'features.log').is_file(), 'missing features proof')
+    if state=='clean':
+        require(d['tested-head']==head and (p/'tested-head').read_text().strip()==head, 'tested-head mismatch')
+        require(d['failure'] is None and all(m[k]=='passed' for k in ('inventory','run','identity-failure')) and d['features']=='passed', 'contradictory clean verdict')
+    else:
+        require(state=='tests-failed' and not (p/'tested-head').exists(), 'failure claims tested-head')
+        require(isinstance(d['failure'],str) and bool(d['failure']), 'missing failure reason')
+        require(not (all(m[k]=='passed' for k in ('inventory','run','identity-failure')) and d['features']=='passed' and d['failure']!='lock-final'), 'contradictory failure verdict')
+except (OSError,ValueError,KeyError,TypeError,ET.ParseError) as error:
+    raise SystemExit('receipt assertion: malformed or missing artifact: '+str(error))
+print('receipt assertion: '+state+' '+head)
+PY
+}
 # Construct scratch fixture commits without editing the checkout.
 with_file() {
     local base=$1 parent=$2 path=$3 content=$4 idx blob tree
@@ -82,13 +141,15 @@ PY
     # A listing-stage failure reserves its directory before any receipt write.
     failed_root="$EVIDENCE/listing-failure-receipts"
     expect_status 1 "$EVIDENCE/first-listing-failure.log" env MONITOR_REBASE_RESULTS="$failed_root" RUSTC=/nonexistent-monitor-rebase-negative-control bash "$SCRIPT" test "$head"
+    MONITOR_REBASE_RESULTS="$failed_root" assert_receipt tests-failed "$head"
     [[ ! -e $failed_root/$head/run.log ]]
     grep -q '/nonexistent-monitor-rebase-negative-control' "$failed_root/$head/list.stderr"
     python3 - "$failed_root/$head" "$EVIDENCE/listing-failure-bytes.json" <<'PY'
 import json,pathlib,sys
 root=pathlib.Path(sys.argv[1])
 files={str(p.relative_to(root)):p.read_bytes().hex() for p in root.rglob('*') if p.is_file()}
-assert {'tested-head','Cargo.lock.before','list.json','list.stderr','lock-list.txt','lock-final.txt'} <= files.keys()
+assert {'head','receipt-state.json','Cargo.lock.before','list.json','list.stderr','lock-list.txt','lock-final.txt'} <= files.keys()
+assert 'tested-head' not in files
 pathlib.Path(sys.argv[2]).write_text(json.dumps(files,sort_keys=True))
 PY
     expect_status 1 "$EVIDENCE/second-listing-refused.log" env MONITOR_REBASE_RESULTS="$failed_root" RUSTC=/nonexistent-monitor-rebase-negative-control bash "$SCRIPT" test "$head"
@@ -106,6 +167,7 @@ PY
     mkdir -p "$shared_target"
     shared_target=$(cd "$shared_target" && pwd)
     expect_status 0 "$EVIDENCE/clean-test.log" env CARGO_TARGET_DIR="$shared_target" bash "$SCRIPT" test "$head"
+    assert_receipt clean "$head"
     pass test_passes_on_clean_head
     python3 - "$MONITOR_REBASE_RESULTS/$head" "$shared_target" <<'PY'
 import json,pathlib,sys,xml.etree.ElementTree as ET

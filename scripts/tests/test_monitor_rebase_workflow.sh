@@ -3,6 +3,8 @@ set -euo pipefail
 # Real production transitions, real git remotes/leases and real Rust test commands.
 # Only GitHub's PR/label API is stubbed. Every case has a separate receipt root.
 source "$(dirname "$0")/test_rebase_monitor.sh"
+HARNESS=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+fixture_args=("$@")
 fixture "$@"
 mkdir "$FIXTURE/bin"
 export GH_FIXTURE="$FIXTURE/github.json"
@@ -39,10 +41,33 @@ PY
 chmod +x "$FIXTURE/bin/gh"
 export PATH="$FIXTURE/bin:$PATH"
 case_run() {
-    local name=$1 expected=$2
-    shift 2
+    local name=$1 expected=$2 receipt=$3 before after common candidate
+    shift 3
+    common=$(git rev-parse --git-common-dir)
+    before=$(cat "$common/monitor-rebase/prepared" 2>/dev/null || true)
     export MONITOR_REBASE_RESULTS="$EVIDENCE/$name-receipts"
     expect_status "$expected" "$EVIDENCE/$name.log" "$@"
+    after=$(cat "$common/monitor-rebase/prepared" 2>/dev/null || true)
+    case $receipt in
+        clean|tests-failed)
+            if [[ $name == resume_tests_repaired_head_and_updates_tested_head ]]; then
+                candidate=$repaired
+                [[ $before == "$after" ]]
+            else
+                [[ -n $after && $before != "$after" ]]
+                candidate=$(git -C "$after" rev-parse HEAD)
+            fi
+            assert_receipt "$receipt" "$candidate"
+            ;;
+        conflict)
+            [[ -n $after && $before != "$after" && -f $after/REBASE-REPORT.md ]]
+            [[ ! -e $MONITOR_REBASE_RESULTS ]]
+            ;;
+        none)
+            [[ $before == "$after" && ! -e $MONITOR_REBASE_RESULTS ]]
+            ;;
+        *) echo "unknown receipt expectation: $receipt" >&2; exit 1;;
+    esac
 }
 remote_head() { git ls-remote origin "$1" | cut -f1; }
 assert_body() {
@@ -57,7 +82,7 @@ assert 'Test artifacts: https://' in p['body'] and '#artifacts' in p['body']
 assert '```diff' in p['body']
 PY
 }
-case_run discover_skips_carried_tag 0 bash "$SCRIPT" transition discover --tag "$TAG"
+case_run discover_skips_carried_tag 0 none bash "$SCRIPT" transition discover --tag "$TAG"
 [[ $(cat "$GH_FIXTURE") == '{}' ]]
 pass discover_skips_carried_tag
 # A controlled stable tag, one empty-tree commit newer than the carried upstream.
@@ -65,16 +90,26 @@ newbase=$(printf 'simulated upstream\n' | git commit-tree "$TAG^{tree}" -p "$TAG
 newtag=rust-v0.154.1
 git tag "$newtag" "$newbase"
 git push origin "refs/tags/$newtag"
-case_run discover_creates_pr_for_simulated_new_tag 0 bash "$SCRIPT" transition discover --tag "$newtag"
+if [[ ${MONITOR_REBASE_HARNESS_FAULT:-0} == 1 ]]; then
+    case_run discover_creates_pr_for_simulated_new_tag 0 clean env RUSTC=/nonexistent-monitor-rebase-negative-control bash "$SCRIPT" transition discover --tag "$newtag"
+else
+    case_run discover_creates_pr_for_simulated_new_tag 0 clean bash "$SCRIPT" transition discover --tag "$newtag"
+fi
+# The negative subprocess must stop inside the clean receipt assertion above.
+if [[ ${MONITOR_REBASE_HARNESS_FAULT:-0} == 1 ]]; then
+    printf 'next case started\n' > "$MONITOR_REBASE_NEXT_CASE_SENTINEL"
+    exit 0
+fi
 head=$(remote_head "refs/heads/rebase/$newtag")
 assert_body "$newtag" clean "$head"
+assert_receipt clean "$head"
 pass discover_creates_pr_for_simulated_new_tag
 # Fail the real cargo invocation deliberately; do not counterfeit a JUnit receipt.
 failedbase=$(printf 'simulated failing upstream\n' | git commit-tree "$TAG^{tree}" -p "$TAG^{commit}")
 failedtag=rust-v0.154.2
 git tag "$failedtag" "$failedbase"
 git push origin "refs/tags/$failedtag"
-case_run discover_records_tests_failed_with_artifact_link 0 env RUSTC=/nonexistent-monitor-rebase-negative-control bash "$SCRIPT" transition discover --tag "$failedtag"
+case_run discover_records_tests_failed_with_artifact_link 0 tests-failed env RUSTC=/nonexistent-monitor-rebase-negative-control bash "$SCRIPT" transition discover --tag "$failedtag"
 assert_body "$failedtag" tests-failed
 pass discover_records_tests_failed_with_artifact_link
 # Keep scheduling focused on the repaired candidate; archive the failure control.
@@ -85,7 +120,7 @@ PY
 # Move a previously green candidate to an untested, structurally eligible repair.
 repaired=$(with_file "$head" "$newtag" repaired-fixture 'repair')
 git push --force-with-lease="refs/heads/rebase/$newtag:$head" origin "$repaired:refs/heads/rebase/$newtag"
-case_run moved_head_is_landing_ineligible_until_receipt 1 bash "$SCRIPT" landing "$newtag"
+case_run moved_head_is_landing_ineligible_until_receipt 1 none bash "$SCRIPT" landing "$newtag"
 pass moved_head_is_landing_ineligible_until_receipt
 # Advance main to another valid carried commit while the repair stays unchanged.
 origin_monitor=$(python3 - "$newtag" <<'PY'
@@ -103,7 +138,7 @@ git tag v0.154.1-monitor.1 "$advanced_main"
 before_main=$(git rev-parse main)
 common=$(git rev-parse --git-common-dir)
 before_prepare=$(cat "$common/monitor-rebase/prepared")
-case_run resume_tests_repaired_head_and_updates_tested_head 0 bash "$SCRIPT" transition resume
+case_run resume_tests_repaired_head_and_updates_tested_head 0 clean bash "$SCRIPT" transition resume
 [[ $(remote_head "refs/heads/rebase/$newtag") == "$repaired" ]]
 [[ $(cat "$common/monitor-rebase/prepared") == "$before_prepare" ]]
 assert_body "$newtag" clean "$repaired"
@@ -126,12 +161,12 @@ closed_before=$(cat "$GH_FIXTURE")
 for mode in discover resume regenerate; do
     args=(transition "$mode" --tag "$newtag")
     if [[ $mode == regenerate ]]; then args+=(--expected-head "$repaired"); fi
-    case_run "closed-$mode" 0 bash "$SCRIPT" "${args[@]}"
+    case_run "closed-$mode" 0 none bash "$SCRIPT" "${args[@]}"
 done
 [[ $(cat "$GH_FIXTURE") == "$closed_before" && $(remote_head "refs/heads/rebase/$newtag") == "$repaired" ]]
 pass closed_candidate_is_noop
 before_prepare=$(cat "$common/monitor-rebase/prepared")
-case_run regenerate_rejects_candidate_ref_naming_live_candidate 1 bash "$SCRIPT" transition regenerate --tag "$TAG" --expected-head "$SQ" --candidate-ref "refs/heads/rebase/$TAG"
+case_run regenerate_rejects_candidate_ref_naming_live_candidate 1 none bash "$SCRIPT" transition regenerate --tag "$TAG" --expected-head "$SQ" --candidate-ref "refs/heads/rebase/$TAG"
 [[ $(cat "$common/monitor-rebase/prepared") == "$before_prepare" ]]
 [[ -z $(remote_head "refs/heads/rebase/$TAG") ]]
 pass regenerate_rejects_candidate_ref_naming_live_candidate
@@ -140,31 +175,44 @@ one=$(with_file "$TAG" "$TAG" lease-one 'one')
 two=$(with_file "$one" "$one" lease-two 'two')
 proof=refs/heads/rebase/scratch-lease
 git push origin "$two:$proof"
-case_run regenerate_refuses_stale_expected_head_on_existing_ref 1 bash "$SCRIPT" transition regenerate --tag "$TAG" --candidate-ref "$proof" --expected-head "$one"
+case_run regenerate_refuses_stale_expected_head_on_existing_ref 1 clean bash "$SCRIPT" transition regenerate --tag "$TAG" --candidate-ref "$proof" --expected-head "$one"
 grep -q 'stale info' "$EVIDENCE/regenerate_refuses_stale_expected_head_on_existing_ref.log"
 [[ $(remote_head "$proof") == "$two" ]]
 prepared=$(cat "$common/monitor-rebase/prepared")
 [[ $(git -C "$prepared" rev-parse HEAD^) == "$(git rev-parse "$TAG^{commit}")" ]]
 pass regenerate_refuses_stale_expected_head_on_existing_ref
-case_run regenerate_with_matching_head_succeeds 0 bash "$SCRIPT" transition regenerate --tag "$TAG" --candidate-ref "$proof" --expected-head "$two"
+case_run regenerate_with_matching_head_succeeds 0 clean bash "$SCRIPT" transition regenerate --tag "$TAG" --candidate-ref "$proof" --expected-head "$two"
 newproof=$(remote_head "$proof")
+assert_receipt clean "$newproof"
 [[ $newproof != "$two" && $(git rev-parse "$newproof^") == "$(git rev-parse "$TAG^{commit}")" ]]
 [[ $(cat "$GH_FIXTURE") == "$closed_before" ]]
 pass regenerate_with_matching_head_succeeds
+# Omission of candidate-ref has its own clean, structurally resolvable fixture.
+python3 - "$newtag" <<'PY'
+import json,os,sys
+p=os.environ['GH_FIXTURE']; d=json.load(open(p)); d['monitor-rebase/'+sys.argv[1]]['state']='OPEN'; open(p,'w').write(json.dumps(d))
+PY
+case_run regenerate_without_candidate_ref_targets_default_ref 0 clean bash "$SCRIPT" transition regenerate --tag "$newtag" --expected-head "$repaired"
+default_head=$(remote_head "refs/heads/rebase/$newtag")
+assert_body "$newtag" clean "$default_head"
+assert_receipt clean "$default_head"
+prepared=$(cat "$common/monitor-rebase/prepared")
+[[ $(git -C "$prepared" rev-parse HEAD) == "$default_head" ]]
+pass regenerate_without_candidate_ref_targets_default_ref
 # The reference patch yields the real eight conflicts, and repeated regeneration
 # updates the existing PR with a report-only commit through the default ref path.
 git update-ref refs/heads/main ae7dbe6
 git tag -f v0.142.0-monitor.1 ae7dbe6
-case_run initial_conflict 0 bash "$SCRIPT" transition discover --tag "$TAG"
+case_run initial_conflict 0 conflict bash "$SCRIPT" transition discover --tag "$TAG"
 assert_body "$TAG" conflict
 old=$(remote_head "refs/heads/rebase/$TAG")
 [[ $(git diff-tree --no-commit-id --name-only -r "$old") == REBASE-REPORT.md ]]
-case_run regenerate_without_candidate_ref_targets_default_ref 0 bash "$SCRIPT" transition regenerate --tag "$TAG" --expected-head "$old"
+pass initial_conflict
+case_run repeated_conflict_run_updates_same_pr 0 conflict bash "$SCRIPT" transition regenerate --tag "$TAG" --expected-head "$old"
 latest=$(remote_head "refs/heads/rebase/$TAG")
 prepared=$(cat "$common/monitor-rebase/prepared")
 [[ $(git rev-parse "$latest^") == "$(git rev-parse "$TAG^{commit}")" ]]
 assert_body "$TAG" conflict
-pass regenerate_without_candidate_ref_targets_default_ref
 python3 - "$TAG" <<'PY'
 import json,os,sys
 p=json.load(open(os.environ['GH_FIXTURE']))['monitor-rebase/'+sys.argv[1]]
@@ -173,4 +221,11 @@ PY
 pass repeated_conflict_run_updates_same_pr
 git update-ref refs/heads/main "$SQ"
 [[ -z $(git status --porcelain) ]]
+negative_evidence="$EVIDENCE/harness-negative"
+negative_sentinel="$EVIDENCE/negative-next-case-sentinel"
+negative_rc=0
+MONITOR_REBASE_HARNESS_FAULT=1 MONITOR_REBASE_NEXT_CASE_SENTINEL="$negative_sentinel"     bash "$HARNESS" "${fixture_args[0]}" "${fixture_args[1]}" "${fixture_args[2]}" "$negative_evidence"     > "$EVIDENCE/harness-negative.log" 2>&1 || negative_rc=$?
+[[ $negative_rc != 0 && ! -e $negative_sentinel ]]
+grep -q 'receipt assertion: wrong state or stale head' "$EVIDENCE/harness-negative.log"
+pass harness_stops_on_unexpected_failed_receipt
 echo "Scratch evidence retained at $FIXTURE"

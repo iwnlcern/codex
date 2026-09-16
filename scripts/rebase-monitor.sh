@@ -200,6 +200,7 @@ PY
 }
 test_head() (
     local head dir out target junit rc=0 guard=0
+    local inventory=not-run monitor_run=not-run identity=not-run features=not-run stage=setup
     head=$(sha "$1")
     structural "$head" || exit 3
     out="${MONITOR_REBASE_RESULTS:-$STORE/results/v295-codex-fork/impl}/$head"
@@ -207,18 +208,41 @@ test_head() (
     # Reserve every attempt, including failures before the test run starts.
     mkdir "$out" || fail 'receipt already exists; preserve it and select a fresh results root'
     out=$(cd "$out" && pwd)
-    dir=$(mktemp -d "$STORE/test.XXXXXX")
-    git worktree add --detach "$dir/source" "$head"
-    printf '%s\n' "$head" > "$out/tested-head"
-    cd "$dir/source"
-    git show HEAD:codex-rs/Cargo.lock > "$out/Cargo.lock.before"
-    # Validate even when a command fails; never restore an unexplained lock delta.
+    printf '%s\n' "$head" > "$out/head"
+    # Finalize even on compiler/list/identity failure. Never claim a JUnit hash
+    # without an actual file, or a tested-head before both suites and guards pass.
     finish() {
-        python3 scripts/lockfile-delta.py "$out/Cargo.lock.before" codex-rs/Cargo.lock > "$out/lock-final.txt" || guard=$?
-        if [[ $guard == 0 ]]; then git restore -- codex-rs/Cargo.lock; fi
-        [[ $guard == 0 ]] || exit 1
+        local status=$?
+        trap - EXIT
+        if [[ -f $out/Cargo.lock.before ]]; then
+            python3 "$ROOT/scripts/lockfile-delta.py" "$out/Cargo.lock.before" "$dir/source/codex-rs/Cargo.lock" > "$out/lock-final.txt" || guard=$?
+            if [[ $guard == 0 ]]; then git -C "$dir/source" restore -- codex-rs/Cargo.lock || guard=$?; fi
+            if [[ $guard != 0 ]]; then status=1; stage=lock-final; fi
+        fi
+        if [[ $inventory != passed || $monitor_run != passed || $identity != passed || $features != passed ]]; then status=1; fi
+        python3 - "$out" "$head" "$status" "$inventory" "$monitor_run" "$identity" "$features" "$stage" <<'PY'
+import hashlib,json,pathlib,sys
+out=pathlib.Path(sys.argv[1]); head=sys.argv[2]; clean=sys.argv[3]=='0'
+listing,run,identity,features,stage=sys.argv[4:]
+junit=out/'junit.xml'
+d=dict(state='clean' if clean else 'tests-failed',head=head,
+       monitor={'inventory':listing,'run':run,'identity-failure':identity,
+                'junit-sha256':hashlib.sha256(junit.read_bytes()).hexdigest() if junit.exists() else None},
+       features=features,failure=None if clean else stage)
+if clean:
+    d['tested-head']=head
+    (out/'tested-head').write_text(head+'\n')
+(out/'receipt-state.json').write_text(json.dumps(d,sort_keys=True,indent=2)+'\n')
+PY
+        local artifact_status=$?
+        [[ $artifact_status == 0 ]] || status=1
+        exit "$status"
     }
     trap finish EXIT
+    dir=$(mktemp -d "$STORE/test.XXXXXX")
+    git worktree add --detach "$dir/source" "$head"
+    cd "$dir/source"
+    git show HEAD:codex-rs/Cargo.lock > "$out/Cargo.lock.before"
     export CODEX_MONITOR_TESTS_REQUIRE=1 STABLE_GIT_COMMIT="$head" NEXTEST_PROFILE=local
     target=${CARGO_TARGET_DIR:-$PWD/codex-rs/target}
     mkdir -p "$target"
@@ -226,24 +250,38 @@ test_head() (
     export CARGO_TARGET_DIR="$target"
     # Nextest's default store is workspace-relative, independent of Cargo's cache.
     junit="$PWD/codex-rs/target/nextest/local/junit.xml"
+    stage=list-command
+    inventory=failed
     cd codex-rs
     cargo nextest list -p codex-core -E 'test(monitor)' --message-format json > "$out/list.json" 2> "$out/list.stderr" || rc=$?
     cd ..
     python3 scripts/lockfile-delta.py "$out/Cargo.lock.before" codex-rs/Cargo.lock > "$out/lock-list.txt" || exit 1
     [[ $rc == 0 ]] || exit 1
+    stage=list-identity
     receipt_check list "$out/list.json"
+    inventory=passed
+    stage=monitor-command
+    monitor_run=failed
     rm -f "$junit"
     (cd codex-rs; just test -p codex-core -E 'test(monitor)' --retries 0) > "$out/run.log" 2>&1 || rc=$?
     cat "$out/run.log"
     python3 scripts/lockfile-delta.py "$out/Cargo.lock.before" codex-rs/Cargo.lock > "$out/lock-monitor.txt" || exit 1
+    if [[ $rc == 0 ]]; then monitor_run=passed; fi
     [[ -f $junit ]] || exit 1
     cp "$junit" "$out/junit.xml"
-    [[ $rc == 0 ]] || exit 1
-    receipt_check junit "$out/junit.xml"
+    stage=monitor-identity
+    identity=failed
+    if receipt_check junit "$out/junit.xml"; then identity=passed; fi
+    [[ $rc == 0 && $identity == passed ]] || exit 1
+    stage=features-command
+    features=failed
     (cd codex-rs; just test -p codex-features --retries 0) > "$out/features.log" 2>&1 || rc=$?
     cat "$out/features.log"
-    [[ $rc == 0 ]]
+    [[ $rc == 0 ]] || exit 1
+    features=passed
+    stage=complete
 )
+
 transition() {
     local mode=${1:?mode required} tag='' expected='' candidate='' state snapshot head tested='' dir rc=0 monitor body artifact
     shift
