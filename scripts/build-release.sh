@@ -124,6 +124,15 @@ build_macos() (
   }
   trap cleanup_lock EXIT
 
+  if ! command -v rustup >/dev/null 2>&1 && [[ -n ${HOME:-} && -f $HOME/.cargo/env ]]; then
+    # rustup's installer records its non-login-shell PATH setup here.
+    # shellcheck disable=SC1091 # The user-specific rustup environment is discovered at runtime.
+    source "$HOME/.cargo/env"
+  fi
+  command -v rustup >/dev/null 2>&1 || {
+    echo "Native build prerequisite missing: install rustup from https://rustup.rs so \$HOME/.cargo/env exists" >&2
+    exit 1
+  }
   (cd codex-rs && rustup show active-toolchain)
   [[ $(cd codex-rs && rustc -vV | awk '/^host:/ { print $2 }') == "$target" ]] || {
     echo "macos target $target must match the native rustc host" >&2

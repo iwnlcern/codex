@@ -81,6 +81,7 @@ If the path already exists before the cold timing, stop and select a reviewed fr
 | Operating systems           | macOS 12+, Ubuntu 20.04+/Debian 10+, or Windows 11 **via WSL2** |
 | Git (optional, recommended) | 2.23+ for built-in PR helpers                                   |
 | RAM                         | 4-GB minimum (8-GB recommended)                                 |
+| Rust toolchain manager      | `rustup` installed from `rustup.rs`, with `$HOME/.cargo/env`     |
 
 ### DotSlash
 
