@@ -1,4 +1,78 @@
-## Installing & building
+## Installing the monitor-enabled development artifact
+
+The monitor-enabled binary produced before the final Task 10 squash is a development artifact.
+Its identity is the exact commit in the adjacent `MANIFEST` `source_commit` field, regardless of the branch or filename used to distribute it.
+Only binaries built by Task 10 from the final squashed head are release artifacts.
+
+Build a native macOS development artifact from the repository root with:
+
+```bash
+scripts/build-release.sh macos aarch64-apple-darwin
+```
+
+Build the digest-pinned Linux musl development artifact from the repository root with:
+
+```bash
+scripts/build-release.sh linux aarch64-unknown-linux-musl
+```
+
+The recipes write `dist/<target>/codex` and `dist/<target>/MANIFEST`.
+They intentionally use Cargo without `--locked`, validate that the effective lockfile differs only by the expected workspace version lines, and record its SHA-256.
+
+### Replace only the npm binary slot
+
+Locate the platform package inside the active Codex npm installation.
+For Apple silicon, the binary slot is:
+
+```text
+node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex
+```
+
+The corresponding Linux ARM64 package uses:
+
+```text
+node_modules/@openai/codex-linux-arm64/vendor/aarch64-unknown-linux-musl/bin/codex
+```
+
+Back up the existing `codex` file, then copy `dist/<target>/codex` into that exact slot and preserve its executable bit.
+Replace only the `codex` binary.
+Keep the npm package's `codex-code-mode-host`, `rg`, and zsh companion resources in place.
+
+### Verify the installed bytes
+
+Set `slot` to the replaced npm vendor path and `manifest` to the matching development or release `MANIFEST`.
+Then verify the binary bytes and feature state:
+
+```bash
+expected=$(awk -F= '$1 == "binary_sha256" { print $2 }' "$manifest")
+actual=$(shasum -a 256 "$slot" | awk '{print $1}')
+test "$actual" = "$expected"
+"$slot" --version
+"$slot" features list | grep -E '^monitor[[:space:]]+stable[[:space:]]+true$'
+```
+
+On Linux, use `sha256sum "$slot"` in place of `shasum -a 256 "$slot"` when `shasum` is unavailable.
+Record the `MANIFEST`, the resolved npm vendor path, and the successful command output with the install evidence.
+
+The companion witness is a code-mode tool call made through the installed CLI while a host process listing shows `codex-code-mode-host` running from the same npm vendor tree.
+This confirms that replacing the binary slot preserved and selected the npm package's companion executable.
+
+### Measured build timings
+
+The stock `rust-v0.154.0` Apple silicon baseline was 21 minutes 19 seconds for a cold build.
+Task 9 records the recipe's native macOS cold and warm timings and its digest-pinned Linux timing here only after the reviewed recipe is committed and executed.
+The native recipe uses the dedicated `codex-rs/target-task9-release` cache for both the build and binary lookup.
+Before the cold timing, verify that this path is absent; preserve it after the cold build and run the same command again for the warm timing.
+If the path already exists before the cold timing, stop and select a reviewed fresh-cache disposition instead of deleting or reusing it as a cold cache.
+
+| Build | Source | Elapsed time |
+| --- | --- | --- |
+| Stock tag, macOS cold | `rust-v0.154.0` baseline | 21 min 19 s |
+| Monitor candidate, macOS cold | Pending reviewed recipe execution | Pending |
+| Monitor candidate, macOS warm | Pending reviewed recipe execution | Pending |
+| Monitor candidate, Linux ARM64 musl | Pending reviewed recipe execution | Pending |
+
+## Building the upstream project
 
 ### System requirements
 
