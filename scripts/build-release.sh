@@ -167,7 +167,7 @@ build_macos() (
 
 build_linux() (
   local platform_arch zig_arch zig_sha export_dir dist_dir rc
-  local daemon_info daemon_mem_bytes daemon_cpus extra
+  local daemon_info daemon_mem_bytes daemon_cpus extra running_containers running_count
   case $target in
     aarch64-unknown-linux-musl)
       platform_arch=arm64
@@ -198,8 +198,24 @@ build_linux() (
   }
   printf 'docker_daemon_mem_total_bytes=%s\n' "$daemon_mem_bytes"
   printf 'docker_daemon_ncpu=%s\n' "$daemon_cpus"
-  ((10#$daemon_mem_bytes >= 4 * 1024 * 1024 * 1024)) || {
-    echo "Linux build requires at least 4 GiB of Docker daemon memory" >&2
+  # These snapshots are informational: other containers may start or stop afterward.
+  if running_containers=$(docker ps --format '{{.Names}}'); then
+    running_count=0
+    if [[ -n $running_containers ]]; then
+      running_count=$(printf '%s\n' "$running_containers" | wc -l | tr -d '[:space:]')
+    fi
+    printf 'docker_other_running_container_count=%s\n' "$running_count"
+    printf 'docker_other_running_container_names_begin\n%s\ndocker_other_running_container_names_end\n' "$running_containers"
+  else
+    echo "Docker running-container snapshot unavailable (informational)" >&2
+  fi
+  echo 'docker_other_container_memory_begin'
+  docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' || {
+    echo "Docker container-memory snapshot unavailable (informational)" >&2
+  }
+  echo 'docker_other_container_memory_end'
+  ((10#$daemon_mem_bytes >= 16 * 1024 * 1024 * 1024)) || {
+    echo "Linux build requires at least 16 GiB of Docker daemon memory: measured native peaks are a 12.8 GB final link and a 7.1 GB library compile" >&2
     exit 1
   }
 
@@ -236,7 +252,7 @@ cpu_count=$(nproc)
   echo "Invalid nproc result: $cpu_count" >&2
   exit 1
 }
-memory_jobs=$(((10#$mem_total_kib - 1024 * 1024) / (2 * 1024 * 1024)))
+memory_jobs=$(((10#$mem_total_kib - 2 * 1024 * 1024) / (7 * 1024 * 1024)))
 ((memory_jobs >= 1)) || memory_jobs=1
 if ((10#$cpu_count < memory_jobs)); then
   CARGO_BUILD_JOBS=$cpu_count

@@ -16,9 +16,29 @@ Build the digest-pinned Linux musl development artifact from the repository root
 scripts/build-release.sh linux aarch64-unknown-linux-musl
 ```
 
-The Linux recipe requires the Docker daemon to have at least 4 GiB of memory and records the daemon's total memory and CPU count before starting the container.
-Inside the container, it limits Cargo to the smaller of the available CPU count and `floor((MemTotal GiB - 1) / 2)`, with a minimum of one job.
-A larger Docker Desktop memory allotment permits more parallel Cargo jobs and shortens the build.
+The Linux recipe requires at least 16 GiB of Docker daemon memory; 24 GiB is recommended.
+In Docker Desktop, open Settings → Resources → Memory and allocate at least 16 GiB before running the recipe.
+The host preflight records daemon memory and CPU capacity, the count and names of other running containers (`docker ps`), and their memory usage (`docker stats --no-stream`).
+These container snapshots are informational and may change during the build; build when the daemon is otherwise idle.
+Inside the container, Cargo jobs are `min(nproc, max(1, floor((MemTotal GiB - 2) / 7)))`, with the memory, CPU count, and selected job count printed in the transcript.
+With sufficient CPUs, 16 GiB selects two jobs, 24 GiB selects three, and 32 GiB selects four.
+
+The memory policy uses the Planner's native release-build measurements below as a sizing reference.
+A 12.8 GB final link and a 7.1 GB library compile motivate the minimum and per-job allowance; these sampled native peaks are not Linux measurements or a guarantee against exhaustion on a contended daemon.
+
+| Crate | Measured peak resident memory (MB, as reported) |
+| --- | ---: |
+| `codex` (final thin-LTO link) | 12,845 |
+| `codex_tui` | 7,085 |
+| `codex_core` | 5,956 |
+| `codex_app_server` | 4,401 |
+| `codex_exec` | 3,652 |
+| `codex_app_server_protocol` | 2,377 |
+
+Provenance: the v2.9.5 sprint's `results/v295-codex-fork/task9-release-peak-rss/` directory in the `agentic-dev-team-skills` repository retains `README.txt`, `rss-wrapper.sh`, `rss-release.log`, `rss-release.status`, and `build-log-tail.txt`.
+The Planner measured a scratch worktree at `f0490b73`'s tree, whose Rust sources match the Task 9 heads, using `cargo build --release --bin codex -j 6`, `CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=packed`, and upstream V8 artifacts.
+Its `RUSTC_WRAPPER` sampled each rustc's resident set every 0.5 seconds across 1,282 invocations.
+The governing disposition is `v295-b3/SITREP-pair-planner-20260918-154511.md` in that sprint's `.relays/v295/` tree.
 
 The recipes write `dist/<target>/codex` and `dist/<target>/MANIFEST`.
 They intentionally use Cargo without `--locked`, validate that the effective lockfile differs only by the expected workspace version lines, and record its SHA-256.
