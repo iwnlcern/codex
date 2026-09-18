@@ -167,6 +167,7 @@ build_macos() (
 
 build_linux() (
   local platform_arch zig_arch zig_sha export_dir dist_dir rc
+  local daemon_info daemon_mem_bytes daemon_cpus extra
   case $target in
     aarch64-unknown-linux-musl)
       platform_arch=arm64
@@ -183,6 +184,24 @@ build_linux() (
       exit 2
       ;;
   esac
+
+  daemon_info=$(docker info --format '{{.MemTotal}} {{.NCPU}}') || {
+    echo "Unable to read Docker daemon memory and CPU capacity" >&2
+    exit 1
+  }
+  read -r daemon_mem_bytes daemon_cpus extra <<< "$daemon_info"
+  [[ $daemon_mem_bytes =~ ^[1-9][0-9]*$ && ${#daemon_mem_bytes} -le 18 &&
+    $daemon_cpus =~ ^[1-9][0-9]*$ && ${#daemon_cpus} -le 18 &&
+    -z ${extra:-} && $daemon_info != *$'\n'* ]] || {
+    echo "Invalid Docker daemon capacity: $daemon_info" >&2
+    exit 1
+  }
+  printf 'docker_daemon_mem_total_bytes=%s\n' "$daemon_mem_bytes"
+  printf 'docker_daemon_ncpu=%s\n' "$daemon_cpus"
+  ((10#$daemon_mem_bytes >= 4 * 1024 * 1024 * 1024)) || {
+    echo "Linux build requires at least 4 GiB of Docker daemon memory" >&2
+    exit 1
+  }
 
   export_dir=$(mktemp -d "${TMPDIR:-/tmp}/codex-release-export.XXXXXX")
   # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
@@ -207,6 +226,27 @@ build_linux() (
     ubuntu:24.04@sha256:224a1869083a311ef3f13648a154ba79832fbef6364d31493642ca03082da254 \
     bash -s <<'CONTAINER'
 set -euo pipefail
+mem_total_kib=$(awk '$1 == "MemTotal:" { print $2 }' /proc/meminfo)
+cpu_count=$(nproc)
+[[ $mem_total_kib =~ ^[1-9][0-9]*$ && ${#mem_total_kib} -le 18 ]] || {
+  echo "Invalid MemTotal in /proc/meminfo: $mem_total_kib" >&2
+  exit 1
+}
+[[ $cpu_count =~ ^[1-9][0-9]*$ && ${#cpu_count} -le 18 ]] || {
+  echo "Invalid nproc result: $cpu_count" >&2
+  exit 1
+}
+memory_jobs=$(((10#$mem_total_kib - 1024 * 1024) / (2 * 1024 * 1024)))
+((memory_jobs >= 1)) || memory_jobs=1
+if ((10#$cpu_count < memory_jobs)); then
+  CARGO_BUILD_JOBS=$cpu_count
+else
+  CARGO_BUILD_JOBS=$memory_jobs
+fi
+export CARGO_BUILD_JOBS
+printf 'container_mem_total_kib=%s\n' "$mem_total_kib"
+printf 'container_nproc=%s\n' "$cpu_count"
+printf 'cargo_build_jobs=%s\n' "$CARGO_BUILD_JOBS"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y binutils pkg-config libcap-dev curl ca-certificates git xz-utils python3 make

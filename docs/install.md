@@ -16,6 +16,10 @@ Build the digest-pinned Linux musl development artifact from the repository root
 scripts/build-release.sh linux aarch64-unknown-linux-musl
 ```
 
+The Linux recipe requires the Docker daemon to have at least 4 GiB of memory and records the daemon's total memory and CPU count before starting the container.
+Inside the container, it limits Cargo to the smaller of the available CPU count and `floor((MemTotal GiB - 1) / 2)`, with a minimum of one job.
+A larger Docker Desktop memory allotment permits more parallel Cargo jobs and shortens the build.
+
 The recipes write `dist/<target>/codex` and `dist/<target>/MANIFEST`.
 They intentionally use Cargo without `--locked`, validate that the effective lockfile differs only by the expected workspace version lines, and record its SHA-256.
 
