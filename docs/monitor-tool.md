@@ -44,6 +44,21 @@ After a loss notice, run the consumer's `replay` for every retained `(root, seat
 For every replayed row, check whether its addressed work has already been handled before acting.
 Replay fixes an upper bound without advancing progress.
 
+
+## P0 token measurement
+
+Task 9 measured the maximum-size fixture `max_item_serialized_size_recorded` from `codex-rs/core/src/unified_exec/monitor_frame_tests.rs` at source commit `b451f852c7f998e5b1a2243b72b1849e806d9687`.
+The model-visible text is exactly 8,192 UTF-8 bytes, including `MonitorNotification` markers, its description prefix, the delivery header, stdout markers, and record separators.
+The fixture uses monitor id `m1`, a 256-byte description of repeated `d`, delivery sequence `18446744073709551415`, and NUL records of 4,096 and 3,471 bytes.
+With Python 3.14.6 and `tiktoken` 0.14.0, byte-level BPE counts are 3,944 tokens for `o200k_base` and 7,727 tokens for `cl100k_base`, both below 8,192.
+These counts describe this fixture under the named encodings, not a universal token bound for every allowed notification or model tokenizer.
+The measured text SHA-256 is `0549f2cd5f4b3c4cb592818ef9eca810dfbd6f4d232aa8f99e82a8ffe8178169`.
+The measurement counts actual NUL bytes in rendered text, not the 46,203-byte serialized ResponseItem JSON.
+
+The kit sprint retains `results/v295-codex-fork/impl/task9-p0-measure.py` and the source-bound `impl/b451f852c7f998e5b1a2243b72b1849e806d9687/task9/p0/` evidence directory beneath `results/v295-codex-fork/`.
+That directory contains the exact text, source snapshots and hashes, tokenizer metadata, token-id arrays, and an independent Rust rendering witness that matches the reconstructed text byte for byte.
+Both token decodings also round-trip to the exact measured bytes.
+
 ## Sandbox
 
 Monitor commands use the same shared preparation and selected sandbox policy as shell-tool children, including the policy environment and `CODEX_THREAD_ID`.

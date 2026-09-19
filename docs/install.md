@@ -84,7 +84,7 @@ This confirms that replacing the binary slot preserved and selected the npm pack
 ### Measured build timings
 
 The stock `rust-v0.154.0` Apple silicon baseline was 21 minutes 19 seconds for a cold build.
-Task 9 records the recipe's native macOS cold and warm timings and its digest-pinned Linux timing here only after the reviewed recipe is committed and executed.
+Task 9 measured the reviewed, committed recipe at the development source commits below.
 The native recipe uses the dedicated `codex-rs/target-task9-release` cache for both the build and binary lookup.
 Before the cold timing, verify that this path is absent; preserve it after the cold build and run the same command again for the warm timing.
 If the path already exists before the cold timing, stop and select a reviewed fresh-cache disposition instead of deleting or reusing it as a cold cache.
@@ -92,9 +92,24 @@ If the path already exists before the cold timing, stop and select a reviewed fr
 | Build | Source | Elapsed time |
 | --- | --- | --- |
 | Stock tag, macOS cold | `rust-v0.154.0` baseline | 21 min 19 s |
-| Monitor candidate, macOS cold | Pending reviewed recipe execution | Pending |
-| Monitor candidate, macOS warm | Pending reviewed recipe execution | Pending |
-| Monitor candidate, Linux ARM64 musl | Pending reviewed recipe execution | Pending |
+| Monitor candidate, macOS cold | `528b05a21ac1d435beb70eeb3d2f2396fc7d9120` | 16 min 3 s (963 s; `time` 963.12 s) |
+| Monitor candidate, macOS warm | `528b05a21ac1d435beb70eeb3d2f2396fc7d9120` | 6 s (`time` 6.52 s) |
+| Monitor candidate, Linux ARM64 musl, passing attempt 3 | `b451f852c7f998e5b1a2243b72b1849e806d9687` | 27 min 5 s (1,625 s; `time` 1625.63 s) |
+
+
+These are development artifacts bound to the separate source commits in their MANIFESTs; this documentation update does not rebind either binary to a newer commit.
+The native function remained byte-identical through the Linux-only repairs at `b451f852c7f998e5b1a2243b72b1849e806d9687`, so the measured native cold and warm runs stand without a rerun.
+The native function SHA-256 is `df43276efcb96565b653c203bd9b42560bf700ac7d0f6181d9867b99d879a195`.
+The passing Linux run used a daemon reporting 25,162,043,392 bytes, 15 CPUs, and three Cargo jobs; its preflight recorded one other running container using 5.168 MiB.
+Its Cargo phase took 25 min 56 s; the table reports the full recipe time, including setup and verification.
+
+Linux attempts 1 and 2 were failed builds, not successful timing samples.
+Attempt 1 at `528b05a21ac1d435beb70eeb3d2f2396fc7d9120` ran for 1,343 seconds and exited 101; the Planner's `SITREP-pair-planner-20260918-140655.md` records the VM kernel's global out-of-memory kill evidence.
+Attempt 2 at `0e58d5d792878613de674f0d56779fff6e52dfcc` ran for 677 seconds and failed with SIGKILL diagnostics; its exact recipe exit is unknown because the old wrapper read Bash's `PIPESTATUS` under zsh.
+The Planner's `SITREP-pair-planner-20260918-154511.md` records two additional global out-of-memory kills and matching daemon OOM events for attempt 2, alongside competing containers in the same VM.
+Both dispositions are retained under the kit sprint's `.relays/v295/v295-b3/` tree.
+Raw build logs, wrapper metadata, verification receipts, and MANIFEST copies are retained under `results/v295-codex-fork/impl/<source-commit>/task9/` in that sprint.
+The stock cold baseline is retained as `results/v295-codex-fork/macos-build-cold.txt`.
 
 ## Building the upstream project
 
