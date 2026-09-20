@@ -42,6 +42,12 @@ fn under_development_features_are_disabled_by_default() {
 }
 
 #[test]
+fn monitor_feature_is_stable_and_enabled_by_default() {
+    assert_eq!(Feature::Monitor.stage(), Stage::Stable);
+    assert_eq!(Feature::Monitor.default_enabled(), true);
+}
+
+#[test]
 fn tool_registry_config_is_not_a_feature_toggle() {
     let features: FeaturesToml = toml::from_str(
         "[tool_registry]\nerror_on_tool_collisions = true\nturn_metadata_includes_tool_info = true\n",
