@@ -419,6 +419,7 @@ impl ExecCommandHandler {
 
         emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
         let request = ExecCommandRequest {
+            output_mode: crate::unified_exec::UnifiedExecOutputMode::Combined,
             command,
             shell_type,
             hook_command: hook_command.clone(),
