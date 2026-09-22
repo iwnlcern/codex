@@ -411,6 +411,7 @@ impl ExecCommandHandler {
         // Preparation can be cancelled. Reserve a process only once it is done.
         let process_id = manager.allocate_process_id().await;
         let request = ExecCommandRequest {
+            output_mode: crate::unified_exec::UnifiedExecOutputMode::Combined,
             command,
             shell: resolved_command.shell,
             hook_command: hook_command.clone(),
