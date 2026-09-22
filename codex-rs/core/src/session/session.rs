@@ -1768,6 +1768,7 @@ impl Session {
                 unified_exec_manager: UnifiedExecProcessManager::new(
                     config.background_terminal_max_timeout,
                 ),
+                monitor_manager: MonitorManager::new(),
                 elicitations: crate::elicitation::ElicitationService::new(),
                 analytics_events_client,
                 hooks: arc_swap::ArcSwap::from_pointee(hooks),
@@ -1907,6 +1908,7 @@ impl Session {
             if let Some(startup) = &startup {
                 startup.set_session(Arc::clone(&sess));
             }
+            sess.services.monitor_manager.attach(Arc::downgrade(&sess));
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;
                 *guard = Arc::downgrade(&sess);
