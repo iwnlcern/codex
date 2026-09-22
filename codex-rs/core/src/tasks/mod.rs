@@ -291,6 +291,8 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) {
+        #[cfg(test)]
+        drop(self.services.monitor_manager.start_task_gate().lock().await);
         // Replace the cache; in-flight acquisitions retain their previous Arc.
         self.services
             .thread_extension_data

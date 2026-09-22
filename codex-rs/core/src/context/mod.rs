@@ -37,6 +37,7 @@ mod legacy_unified_exec_process_limit_warning;
 mod memory;
 mod model_instructions;
 mod model_switch_instructions;
+mod monitor_notification;
 mod multi_agent_mode_instructions;
 mod multi_agent_usage_hint;
 mod network_rule_saved;
@@ -111,6 +112,7 @@ pub(crate) use legacy_unified_exec_process_limit_warning::LegacyUnifiedExecProce
 pub use memory::MemoryContextFragment;
 pub(crate) use model_instructions::ModelInstructions;
 pub(crate) use model_switch_instructions::ModelSwitchInstructions;
+pub(crate) use monitor_notification::MonitorNotification;
 pub(crate) use multi_agent_mode_instructions::MultiAgentModeInstructions;
 pub(crate) use multi_agent_usage_hint::MultiAgentUsageHint;
 pub(crate) use network_rule_saved::NetworkRuleSaved;
