@@ -73,6 +73,7 @@ const REMOTE_NETWORK_POLICY_DECISION_MARGIN: Duration = Duration::from_secs(10);
 /// sandbox preferences have been resolved for the current turn.
 #[derive(Clone, Debug)]
 pub struct UnifiedExecRequest {
+    pub(crate) output_mode: crate::unified_exec::UnifiedExecOutputMode,
     pub command: Vec<String>,
     pub shell_type: ShellType,
     pub hook_command: String,
@@ -673,6 +674,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                             windows_sandbox_proxy_settings_mode,
                             /*network_policy_decider*/ None,
                             req.tty,
+                            &req.output_mode,
                             prepared.spawn_lifecycle,
                             req.turn_environment.environment.as_ref(),
                         )
@@ -730,6 +732,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                 req.shell_snapshot.clone(),
                 windows_sandbox_proxy_settings_mode,
                 req.tty,
+                &req.output_mode,
                 Box::new(NoopSpawnLifecycle),
                 req.turn_environment.environment.as_ref(),
             )
@@ -852,6 +855,7 @@ mod tests {
         let manager = UnifiedExecProcessManager::default();
         let runtime = UnifiedExecRuntime::new(&manager, UnifiedExecShellMode::Direct);
         let request = UnifiedExecRequest {
+            output_mode: crate::unified_exec::UnifiedExecOutputMode::Combined,
             command: vec!["pwd".to_string()],
             shell_type: ShellType::Sh,
             hook_command: "pwd".to_string(),
@@ -955,6 +959,7 @@ mod tests {
         let cwd = AbsolutePathBuf::try_from(std::env::current_dir().unwrap())
             .expect("current dir is absolute");
         UnifiedExecRequest {
+            output_mode: crate::unified_exec::UnifiedExecOutputMode::Combined,
             command: vec!["zsh".to_string(), "-c".to_string(), "echo hi".to_string()],
             shell_type: ShellType::Zsh,
             hook_command: "echo hi".to_string(),

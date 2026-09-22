@@ -290,7 +290,16 @@ use self::turn::collect_explicit_app_ids_from_skill_items;
 use self::turn::realtime_text_for_event;
 use self::turn_context::TurnContext;
 #[cfg(test)]
+mod monitor_delivery_tests;
+#[cfg(test)]
 mod rollout_reconstruction_tests;
+
+/// Two-phase rendezvous barriers for the in-crate gate-boundary witnesses.
+#[cfg(test)]
+pub(crate) struct GateHooks {
+    pub(crate) before_start: Option<Arc<tokio::sync::Barrier>>,
+    pub(crate) after_start: Option<Arc<tokio::sync::Barrier>>,
+}
 
 use crate::exec_policy::ExecPolicyUpdateError;
 use crate::guardian::GuardianReviewSessionManager;
@@ -323,6 +332,7 @@ use crate::tools::sandboxing::ApprovalAction;
 use crate::tools::sandboxing::ApprovalStore;
 use crate::turn_timing::TurnTimingState;
 use crate::turn_timing::record_turn_ttfm_metric;
+use crate::unified_exec::MonitorManager;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
 use crate::windows_sandbox::local_binding_policy_for_sandbox;
@@ -383,6 +393,7 @@ use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TokenUsageRecord;
 use codex_protocol::protocol::TurnModerationMetadataEvent;
 use codex_protocol::protocol::WarningEvent;
+use codex_protocol::turn_input::TurnInput as SubmittedTurnInput;
 use codex_protocol::turn_input::TurnInputMode;
 use codex_protocol::turn_input::TurnInputRequest;
 use codex_protocol::turn_input::TurnInputSubmission;
@@ -1363,6 +1374,19 @@ impl Session {
 
     pub(crate) fn subscribe_elicitation_pause_state(&self) -> watch::Receiver<bool> {
         self.services.elicitations.subscribe()
+    }
+
+    pub(crate) async fn start_turn_if_idle_automatic(
+        self: &Arc<Self>,
+        input: SubmittedTurnInput,
+    ) -> CodexResult<TurnInputSubmission> {
+        turn_input::handle(
+            self,
+            TurnInputRequest::new(input),
+            TurnInputMode::StartIfIdle,
+            new_submission_id(),
+        )
+        .await
     }
 
     pub(crate) fn mark_interrupted(&self) {
