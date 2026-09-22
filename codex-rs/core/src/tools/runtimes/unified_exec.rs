@@ -73,6 +73,7 @@ const REMOTE_NETWORK_POLICY_DECISION_MARGIN: Duration = Duration::from_secs(10);
 /// sandbox preferences have been resolved for the current turn.
 #[derive(Clone, Debug)]
 pub struct UnifiedExecRequest<'a> {
+    pub(crate) output_mode: crate::unified_exec::UnifiedExecOutputMode,
     pub(crate) prepared: &'a PreparedExecCommand,
     pub process_id: i32,
     pub env: HashMap<String, String>,
@@ -642,6 +643,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest<'_>, UnifiedExecAttempt> for UnifiedExec
                 req.shell_snapshot.clone(),
                 windows_sandbox_proxy_settings_mode,
                 prepared.tty,
+                &req.output_mode,
                 prepared.turn_environment.environment.as_ref(),
             )
             .await;
@@ -859,6 +861,7 @@ mod tests {
 
     fn test_request(prepared: &PreparedExecCommand) -> UnifiedExecRequest<'_> {
         UnifiedExecRequest {
+            output_mode: crate::unified_exec::UnifiedExecOutputMode::Combined,
             prepared,
             process_id: 1000,
             env: HashMap::new(),

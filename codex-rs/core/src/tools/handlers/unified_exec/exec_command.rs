@@ -225,6 +225,7 @@ impl ExecCommandHandler {
         let tool_cwd =
             (!prepared.turn_environment.environment.is_remote()).then(|| prepared.cwd.clone());
         let request = ExecCommandRequest {
+            output_mode: crate::unified_exec::UnifiedExecOutputMode::Combined,
             prepared,
             process_id,
             network: context.step_context.turn.network.clone(),
