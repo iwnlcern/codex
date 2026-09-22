@@ -574,6 +574,9 @@ macro_rules! skip_if_sandbox {
         if ::std::env::var($crate::sandbox_env_var())
             == ::core::result::Result::Ok("seatbelt".to_string())
         {
+            if ::std::env::var("CODEX_MONITOR_TESTS_REQUIRE").is_ok() {
+                panic!("skip suppressed by CODEX_MONITOR_TESTS_REQUIRE");
+            }
             eprintln!(
                 "{} is set to 'seatbelt', skipping test.",
                 $crate::sandbox_env_var()
@@ -585,6 +588,9 @@ macro_rules! skip_if_sandbox {
         if ::std::env::var($crate::sandbox_env_var())
             == ::core::result::Result::Ok("seatbelt".to_string())
         {
+            if ::std::env::var("CODEX_MONITOR_TESTS_REQUIRE").is_ok() {
+                panic!("skip suppressed by CODEX_MONITOR_TESTS_REQUIRE");
+            }
             eprintln!(
                 "{} is set to 'seatbelt', skipping test.",
                 $crate::sandbox_env_var()
@@ -598,6 +604,9 @@ macro_rules! skip_if_sandbox {
 macro_rules! skip_if_no_network {
     () => {{
         if ::std::env::var($crate::sandbox_network_env_var()).is_ok() {
+            if ::std::env::var("CODEX_MONITOR_TESTS_REQUIRE").is_ok() {
+                panic!("skip suppressed by CODEX_MONITOR_TESTS_REQUIRE");
+            }
             println!(
                 "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
             );
@@ -606,6 +615,9 @@ macro_rules! skip_if_no_network {
     }};
     ($return_value:expr $(,)?) => {{
         if ::std::env::var($crate::sandbox_network_env_var()).is_ok() {
+            if ::std::env::var("CODEX_MONITOR_TESTS_REQUIRE").is_ok() {
+                panic!("skip suppressed by CODEX_MONITOR_TESTS_REQUIRE");
+            }
             println!(
                 "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
             );

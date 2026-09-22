@@ -118,6 +118,7 @@ async fn exec_command_with_tty(
                 codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
                 /*network_policy_decider*/ None,
                 tty,
+                &super::UnifiedExecOutputMode::Combined,
                 Box::new(NoopSpawnLifecycle),
                 turn.initial_environments
                     .primary()
@@ -786,6 +787,7 @@ async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
             /*network_policy_decider*/ None,
             /*tty*/ false,
+            &super::UnifiedExecOutputMode::Combined,
             Box::new(NoopSpawnLifecycle),
             &environment,
         )
@@ -829,6 +831,7 @@ async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Resul
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
             /*network_policy_decider*/ None,
             /*tty*/ true,
+            &super::UnifiedExecOutputMode::Combined,
             Box::new(NoopSpawnLifecycle),
             remote_test_env.environment(),
         )
@@ -880,6 +883,7 @@ async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
             /*network_policy_decider*/ None,
             /*tty*/ true,
+            &super::UnifiedExecOutputMode::Combined,
             Box::new(TestSpawnLifecycle {
                 inherited_fds: vec![42],
             }),

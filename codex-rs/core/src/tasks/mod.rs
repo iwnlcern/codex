@@ -288,6 +288,8 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) {
+        #[cfg(test)]
+        drop(self.services.monitor_manager.start_task_gate().lock().await);
         self.activate_plugin_selection(&turn_context).await;
         // Inherited or recovered roots are applied before task start. Otherwise this
         // task owns its turn, including background work. Later mail cannot change it.
