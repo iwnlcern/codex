@@ -1048,6 +1048,9 @@
             "model_catalog_in_context": {
               "type": "boolean"
             },
+            "monitor": {
+              "type": "boolean"
+            },
             "multi_agent": {
               "type": "boolean"
             },
@@ -7374,6 +7377,9 @@
           "type": "boolean"
         },
         "model_catalog_in_context": {
+          "type": "boolean"
+        },
+        "monitor": {
           "type": "boolean"
         },
         "multi_agent": {

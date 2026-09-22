@@ -118,6 +118,7 @@ async fn exec_command_with_tty(
                 codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
                 /*network_policy_decider*/ None,
                 tty,
+                &super::UnifiedExecOutputMode::Combined,
                 turn.initial_environments
                     .primary()
                     .expect("turn environment")
@@ -778,6 +779,7 @@ async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
             /*network_policy_decider*/ None,
             /*tty*/ false,
+            &super::UnifiedExecOutputMode::Combined,
             &environment,
         )
         .await?;
@@ -820,6 +822,7 @@ async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Resul
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
             /*network_policy_decider*/ None,
             /*tty*/ true,
+            &super::UnifiedExecOutputMode::Combined,
             remote_test_env.environment(),
         )
         .await?;

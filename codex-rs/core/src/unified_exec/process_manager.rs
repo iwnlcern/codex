@@ -490,6 +490,51 @@ impl UnifiedExecProcessManager {
         }
     }
 
+    pub(crate) async fn exec_monitor_command(
+        &self,
+        request: ExecCommandRequest,
+        context: &UnifiedExecContext,
+        slot: super::monitor::MonitorSlot,
+    ) -> Result<super::monitor::MonitorProcess, (UnifiedExecError, super::monitor::MonitorSlot)>
+    {
+        if request.turn_environment.environment.is_remote() {
+            return Err((UnifiedExecError::unsupported("remote-execution"), slot));
+        }
+        if context.cancellation_token.is_cancelled() {
+            return Err((
+                UnifiedExecError::process_failed("monitor preparation cancelled".into()),
+                slot,
+            ));
+        }
+        let opened = self
+            .open_session_with_sandbox(&request, request.cwd.clone(), context)
+            .await;
+        let (attempt, network_approval) = match opened {
+            Ok(opened) => opened,
+            Err(error) => return Err((error, slot)),
+        };
+        let Some(committed) = attempt.process.attempt else {
+            return Err((UnifiedExecError::unsupported("untagged-monitor"), slot));
+        };
+        let process = Arc::new(attempt.process);
+        let denial_watcher = network_approval.as_ref().map(|approval| {
+            terminate_process_on_network_denial(
+                Arc::clone(&process),
+                Arc::downgrade(&context.session),
+                approval.clone(),
+            )
+        });
+        Ok(super::monitor::MonitorProcess {
+            slot,
+            cancellation: process.cancellation_token(),
+            process,
+            committed,
+            network_approval,
+            denial_watcher,
+            session: Arc::downgrade(&context.session),
+        })
+    }
+
     #[tracing::instrument(
         name = "unified_exec.exec_command",
         level = "info",
@@ -1295,6 +1340,7 @@ impl UnifiedExecProcessManager {
         shell_snapshot: Option<codex_exec_server::ShellSnapshotRequest>,
         windows_sandbox_proxy_settings_mode: codex_sandboxing::WindowsSandboxProxySettingsMode,
         tty: bool,
+        output_mode: &super::UnifiedExecOutputMode,
         environment: &codex_exec_server::Environment,
     ) -> Result<UnifiedExecProcess, ToolError> {
         let mut request = if environment.is_remote() || shell_snapshot.is_some() {
@@ -1322,6 +1368,7 @@ impl UnifiedExecProcessManager {
             windows_sandbox_proxy_settings_mode,
             network_policy_decider,
             tty,
+            output_mode,
             environment,
         )
         .await
@@ -1345,9 +1392,14 @@ impl UnifiedExecProcessManager {
         windows_sandbox_proxy_settings_mode: codex_sandboxing::WindowsSandboxProxySettingsMode,
         network_policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
         tty: bool,
+        output_mode: &super::UnifiedExecOutputMode,
         environment: &codex_exec_server::Environment,
     ) -> Result<UnifiedExecProcess, UnifiedExecError> {
         if environment.is_remote() || request.exec_server_shell_snapshot.is_some() {
+            if matches!(output_mode, super::UnifiedExecOutputMode::Tagged { .. }) {
+                return Err(UnifiedExecError::unsupported("remote-execution"));
+            }
+
             let backend = environment.get_exec_backend();
             let params = exec_server_params_for_request(
                 process_id,
@@ -1451,7 +1503,16 @@ impl UnifiedExecProcessManager {
         .await;
         let spawned =
             spawn_result.map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
-        UnifiedExecProcess::from_spawned(spawned, request.sandbox).await
+        match output_mode {
+            super::UnifiedExecOutputMode::Combined => {
+                UnifiedExecProcess::from_spawned(spawned, request.sandbox).await
+            }
+            super::UnifiedExecOutputMode::Tagged { sink } => {
+                UnifiedExecProcess::from_spawned_tagged(spawned, request.sandbox, sink.clone())
+                    .await
+                    .map(|(process, _)| process)
+            }
+        }
     }
 
     #[tracing::instrument(
@@ -1531,6 +1592,7 @@ impl UnifiedExecProcessManager {
             )
             .await;
         let req = UnifiedExecToolRequest {
+            output_mode: request.output_mode.clone(),
             command: request.command.clone(),
             shell: request.shell.clone(),
             hook_command: request.hook_command.clone(),
